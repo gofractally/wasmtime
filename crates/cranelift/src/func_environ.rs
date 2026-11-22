@@ -974,7 +974,7 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
     }
 
     /// Get the Memory for the given index.
-    fn memory(&self, index: MemoryIndex) -> Memory {
+    pub(crate) fn memory(&self, index: MemoryIndex) -> Memory {
         self.module.memories[index]
     }
 

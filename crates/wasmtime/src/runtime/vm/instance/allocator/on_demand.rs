@@ -89,7 +89,10 @@ unsafe impl InstanceAllocator for OnDemandInstanceAllocator {
         Ok(())
     }
 
-    fn validate_module(&self, _module: &Module, _offsets: &VMOffsets<HostPtr>) -> Result<()> {
+    fn validate_module(&self, module: &Module, _offsets: &VMOffsets<HostPtr>) -> Result<()> {
+        if self.mem_creator.is_some() && module.memories.values().any(|m| m.is_psizam_memory16()) {
+            bail!("memory16 is not supported by custom memory creators");
+        }
         Ok(())
     }
 
@@ -127,7 +130,12 @@ unsafe impl InstanceAllocator for OnDemandInstanceAllocator {
             .unwrap_or_else(|| &DefaultMemoryCreator);
 
         crate::runtime::box_future(async move {
-            let image = if let Some(memory_index) = memory_index {
+            if ty.is_psizam_memory16() && self.mem_creator.is_some() {
+                bail!("memory16 is not supported by custom memory creators");
+            }
+            let image = if ty.is_psizam_memory16() {
+                None
+            } else if let Some(memory_index) = memory_index {
                 request.runtime_info.memory_image(memory_index)?
             } else {
                 None

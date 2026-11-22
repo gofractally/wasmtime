@@ -61,6 +61,8 @@ define_tunables! {
     /// Tunable parameters for WebAssembly compilation.
     #[derive(Clone, Hash, Serialize, Deserialize, Debug)]
     pub struct Tunables {
+        /// Select memory16-v1/p32 for source without a declared profile.
+        pub psizam_memory16: bool,
         /// The garbage collector implementation to use, which implies the layout of
         /// GC objects and barriers that must be emitted in Wasm code.
         pub collector: Option<Collector>,
@@ -257,6 +259,7 @@ impl Tunables {
     /// Returns the default set of tunables for running under MIRI.
     pub fn default_miri() -> Tunables {
         Tunables {
+            psizam_memory16: false,
             collector: None,
 
             // No virtual memory tricks are available on miri so make these
@@ -363,6 +366,7 @@ impl Tunables {
         let page_size_log2 = 16;
         let min = self.gc_heap_initial_size.div_ceil(1 << page_size_log2);
         Memory {
+            psizam_execution_profile: 0,
             idx_type: IndexType::I32,
             limits: Limits { min, max: None },
             shared: false,

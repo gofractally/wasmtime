@@ -524,6 +524,21 @@ impl Module {
             Some((info, index, types)) => (info, index, types),
             None => postcard::from_bytes(code_memory.wasmtime_info())?,
         };
+        for memory in info.module.memories.values() {
+            memory.validate_psizam_execution_profile()?;
+            if engine.tunables().psizam_memory16 && !memory.is_psizam_memory16() {
+                bail!("ordinary-memory artifact cannot be loaded with the memory16 override");
+            }
+        }
+        if info
+            .module
+            .memories
+            .values()
+            .any(|m| m.is_psizam_memory16())
+            && info.module.memories.len() != 1
+        {
+            bail!("memory16 artifacts require exactly one memory");
+        }
 
         // Register function type signatures into the engine for the lifetime
         // of the `Module` that will be returned. This notably also builds up
@@ -595,6 +610,11 @@ impl Module {
     ///
     /// [binary]: https://webassembly.github.io/spec/core/binary/index.html
     pub fn validate(engine: &Engine, binary: &[u8]) -> Result<()> {
+        let profile =
+            wasmtime_environ::psizam_execution_profile(binary, engine.tunables().psizam_memory16)?;
+        if profile != 0 && engine.tunables().winch_callable {
+            bail!("memory16 is not supported by the Winch calling convention");
+        }
         let mut validator = Validator::new_with_features(engine.features());
 
         let mut functions = Vec::new();

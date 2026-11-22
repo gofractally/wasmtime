@@ -36,7 +36,8 @@ use object::{
 use serde_derive::{Deserialize, Serialize};
 use wasmtime_environ::{FlagValue, ObjectKind, OperatorCostStrategy, Tunables, obj};
 
-const VERSION: u8 = 0;
+// Psizam's profile-aware metadata is not upstream Wasmtime's artifact ABI.
+const VERSION: u8 = 1;
 
 /// Verifies that the serialized engine in `mmap` is compatible with the
 /// `engine` provided.
@@ -293,6 +294,10 @@ impl Metadata<'_> {
 
     fn check_tunables(&mut self, other: &Tunables) -> Result<()> {
         let Tunables {
+            // The source override participates in compile-cache hashing, but
+            // saved modules carry their resolved profile. Module admission
+            // enforces the asymmetric override rule after metadata is read.
+            psizam_memory16: _,
             collector,
             memory_reservation,
             memory_guard_size,

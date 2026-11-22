@@ -91,6 +91,8 @@ pub use self::mmap::MmapMemory;
 
 mod malloc;
 pub use self::malloc::MallocMemory;
+mod psizam;
+use self::psizam::Memory16Memory;
 
 #[cfg(feature = "pooling-allocator")]
 mod static_;
@@ -121,6 +123,10 @@ unsafe impl MemoryCreator for DefaultMemoryCreator {
         let memory_tunables = request.tunables();
         let minimum = request.minimum();
         let maximum = request.maximum();
+        if ty.is_psizam_memory16() {
+            ty.validate_psizam_execution_profile()?;
+            return Ok(try_new::<Box<_>>(Memory16Memory::new()?)? as Box<dyn LinearMemory>);
+        }
 
         #[cfg(has_virtual_memory)]
         if memory_tunables.tunables().signals_based_traps
@@ -163,7 +169,17 @@ impl Memory {
         kind: MemoryKind,
     ) -> Result<Self> {
         let (minimum, maximum) = Self::limit_new(ty, limiter).await?;
-        let tunables = engine.tunables();
+        ty.validate_psizam_execution_profile()?;
+        let compact = ty.is_psizam_memory16().then(|| {
+            let mut tunables = engine.tunables().clone();
+            tunables.memory_reservation = 0;
+            tunables.memory_guard_size = 0;
+            tunables.memory_reservation_for_growth = 0;
+            tunables.guard_before_linear_memory = false;
+            tunables.memory_init_cow = false;
+            tunables
+        });
+        let tunables = compact.as_ref().unwrap_or_else(|| engine.tunables());
         let memory_tunables = MemoryTunables::new(tunables, kind);
         let request = MemoryRequest::new(ty, &memory_tunables, minimum, maximum);
         let allocation = creator.new_memory(&request)?;
@@ -188,6 +204,9 @@ impl Memory {
         memory_image_slot: MemoryImageSlot,
         limiter: Option<&mut StoreResourceLimiter<'_>>,
     ) -> Result<Self> {
+        if ty.is_psizam_memory16() {
+            bail!("memory16 is not supported by the pooling allocator");
+        }
         let (minimum, maximum) = Self::limit_new(ty, limiter).await?;
 
         // Assert the memory image was instantiated.
@@ -400,6 +419,9 @@ impl Memory {
     /// Implementation of `memory.atomic.notify` for all memories.
     #[cfg(feature = "threads")]
     pub fn atomic_notify(&mut self, addr: u64, count: u32) -> Result<u32, Trap> {
+        if self.ty().is_psizam_memory16() {
+            return Ok(0);
+        }
         match self.as_shared_memory() {
             Some(m) => m.atomic_notify(addr, count),
             None => {
@@ -417,6 +439,9 @@ impl Memory {
         expected: u32,
         timeout: Option<core::time::Duration>,
     ) -> Result<crate::WaitResult, Trap> {
+        if self.ty().is_psizam_memory16() {
+            return Err(Trap::AtomicWaitNonSharedMemory);
+        }
         match self.as_shared_memory() {
             Some(m) => m.atomic_wait32(addr, expected, timeout),
             None => {
@@ -434,6 +459,9 @@ impl Memory {
         expected: u64,
         timeout: Option<core::time::Duration>,
     ) -> Result<crate::WaitResult, Trap> {
+        if self.ty().is_psizam_memory16() {
+            return Err(Trap::AtomicWaitNonSharedMemory);
+        }
         match self.as_shared_memory() {
             Some(m) => m.atomic_wait64(addr, expected, timeout),
             None => {
@@ -487,6 +515,12 @@ impl LocalMemory {
         mut alloc: Box<dyn LinearMemory>,
         memory_image: Option<&Arc<MemoryImage>>,
     ) -> Result<LocalMemory> {
+        ty.validate_psizam_execution_profile()?;
+        if ty.is_psizam_memory16()
+            && alloc.as_ref().type_id() != core::any::TypeId::of::<Memory16Memory>()
+        {
+            bail!("memory16 requires its compact private allocator");
+        }
         // If a memory image was specified, give the allocation a chance to
         // initialize itself from it. If it declines then the data segments
         // are copied in as usual.

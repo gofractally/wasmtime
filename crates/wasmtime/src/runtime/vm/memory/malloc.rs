@@ -152,6 +152,7 @@ mod tests {
     // the creation of a `MallocMemory`, so just have a single one used in
     // tests below.
     const TY: wasmtime_environ::Memory = wasmtime_environ::Memory {
+        psizam_execution_profile: 0,
         idx_type: wasmtime_environ::IndexType::I32,
         limits: wasmtime_environ::Limits { min: 0, max: None },
         shared: false,

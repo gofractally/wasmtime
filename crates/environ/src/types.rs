@@ -2302,6 +2302,8 @@ impl TypeTrace for Table {
 /// WebAssembly linear memory.
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Memory {
+    /// Psizam execution-profile record; zero selects standard WebAssembly.
+    pub psizam_execution_profile: u32,
     /// The type of the index used to access the memory.
     pub idx_type: IndexType,
     /// The limits constrain the minimum and optionally the maximum size of a memory.
@@ -2319,7 +2321,42 @@ pub struct Memory {
 /// Maximum size, in bytes, of 32-bit memories (4G)
 pub const WASM32_MAX_SIZE: u64 = 1 << 32;
 
+/// Logical byte length of memory16-v1.
+pub const PSIZAM_MEMORY16_LOGICAL_BYTES: usize = 65536;
+/// Private writable memory16-v1 state, excluding allocator alignment.
+pub const PSIZAM_MEMORY16_ACCESSIBLE_BYTES: usize = 131086;
+/// Memory16-v1 with 16-bit stored pointers and Wasm32 operands.
+pub const PSIZAM_MEMORY16_P16: u32 = 0x0010_1001;
+/// Memory16-v1 with the ordinary 32-bit pointer ABI.
+pub const PSIZAM_MEMORY16_P32: u32 = 0x0020_1001;
+
 impl Memory {
+    /// Whether this memory uses either recognized memory16-v1 pointer ABI.
+    pub fn is_psizam_memory16(&self) -> bool {
+        matches!(
+            self.psizam_execution_profile,
+            PSIZAM_MEMORY16_P16 | PSIZAM_MEMORY16_P32
+        )
+    }
+
+    /// Validate the stored profile and its required memory declaration.
+    pub fn validate_psizam_execution_profile(&self) -> crate::error::Result<()> {
+        if self.psizam_execution_profile == 0 {
+            return Ok(());
+        }
+        if !self.is_psizam_memory16() {
+            crate::error::bail!("unknown psizam execution profile");
+        }
+        if self.shared
+            || self.idx_type != IndexType::I32
+            || self.page_size_log2 != 16
+            || self.limits.min != 1
+            || self.limits.max != Some(1)
+        {
+            crate::error::bail!("memory16 requires one nonshared memory32 with initial=max=1 page");
+        }
+        Ok(())
+    }
     /// WebAssembly page sizes are 64KiB by default.
     pub const DEFAULT_PAGE_SIZE: u32 = 0x10000;
 
@@ -2411,7 +2448,9 @@ impl Memory {
     /// virtual memory traps (e.g. SIGSEGV) cannot be relied on to implement
     /// linear memory semantics.
     pub fn can_use_virtual_memory(&self, tunables: &Tunables, host_page_size_log2: u8) -> bool {
-        tunables.signals_based_traps && self.page_size_log2 >= host_page_size_log2
+        !self.is_psizam_memory16()
+            && tunables.signals_based_traps
+            && self.page_size_log2 >= host_page_size_log2
     }
 
     /// Returns whether this memory is a candidate for bounds check elision
@@ -2543,6 +2582,7 @@ impl From<wasmparser::MemoryType> for Memory {
             "invalid page_size_log2: {page_size_log2}; must be 16 or 0"
         );
         Memory {
+            psizam_execution_profile: 0,
             idx_type,
             limits,
             shared: ty.shared,

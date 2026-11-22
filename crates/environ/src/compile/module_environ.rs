@@ -451,11 +451,17 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
         data: &'data [u8],
     ) -> Result<ModuleTranslation<'data>> {
         self.result.wasm = data;
+        let profile = crate::psizam_execution_profile(data, self.tunables.psizam_memory16)?;
+        if profile != 0 && self.tunables.winch_callable {
+            bail!("memory16 is not supported by the Winch calling convention");
+        }
 
         for payload in parser.parse_all(data) {
             self.translate_payload(payload?)?;
         }
-
+        for memory in self.result.module.memories.values_mut() {
+            memory.psizam_execution_profile = profile;
+        }
         Ok(self.result)
     }
 
@@ -1221,7 +1227,14 @@ impl ModuleTranslation<'_> {
         // runs. If a table initializer can trap, using a memory image would
         // initialize memory even though the startup function should trap
         // before reaching the memory initializers.
-        if tunables.memory_init_cow && !self.table_initialization_may_trap() {
+        if tunables.memory_init_cow
+            && !self.table_initialization_may_trap()
+            && !self
+                .module
+                .memories
+                .values()
+                .any(|m| m.is_psizam_memory16())
+        {
             self.try_static_init(page_size, max_image_size_always_allowed);
         }
 

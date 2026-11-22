@@ -3283,6 +3283,7 @@ impl Default for MemoryTypeBuilder {
     fn default() -> Self {
         MemoryTypeBuilder {
             ty: Memory {
+                psizam_execution_profile: 0,
                 idx_type: IndexType::I32,
                 limits: Limits { min: 0, max: None },
                 shared: false,
@@ -3309,6 +3310,7 @@ impl MemoryTypeBuilder {
     }
 
     fn validate(&self) -> Result<()> {
+        self.ty.validate_psizam_execution_profile()?;
         if self
             .ty
             .limits
@@ -3418,6 +3420,14 @@ impl MemoryTypeBuilder {
     /// WebAssembly which is not fully standardized yet.
     pub fn page_size_log2(&mut self, page_size_log2: u8) -> &mut Self {
         self.ty.page_size_log2 = page_size_log2;
+        self
+    }
+
+    /// Explicitly provision memory16-v1 backing with a 16- or 32-bit pointer
+    /// ABI. The memory must also have initial and maximum sizes of one page.
+    /// Other pointer widths are rejected by [`Self::build`].
+    pub fn psizam_memory16(&mut self, pointer_bits: u8) -> &mut Self {
+        self.ty.psizam_execution_profile = u32::from_le_bytes([1, 16, pointer_bits, 0]);
         self
     }
 

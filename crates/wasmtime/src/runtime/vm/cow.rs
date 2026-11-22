@@ -893,6 +893,7 @@ mod test {
 
     fn dummy_memory() -> Memory {
         Memory {
+            psizam_execution_profile: 0,
             idx_type: IndexType::I32,
             limits: Limits { min: 0, max: None },
             shared: false,

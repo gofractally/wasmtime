@@ -2357,6 +2357,16 @@ impl Config {
         self
     }
 
+    /// Select memory16-v1/p32 for untagged core Wasm source.
+    ///
+    /// Valid `psizam.execution` declarations select their own profile even
+    /// when this is false. The resolved profile is stored per memory and is
+    /// restored from serialized modules. This does not change guest pointers.
+    pub fn psizam_memory16(&mut self, enable: bool) -> &mut Self {
+        self.tunables.psizam_memory16 = Some(enable);
+        self
+    }
+
     /// A configuration option to force the usage of `memfd_create` on Linux to
     /// be used as the backing source for a module's initial memory image.
     ///

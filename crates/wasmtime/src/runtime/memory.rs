@@ -537,6 +537,19 @@ impl Memory {
         self.internal_data_size(store.as_context().0)
     }
 
+    /// Complete private state length for a memory16-v1 allocation.
+    ///
+    /// Returns `Some(131086)` only for actual profile-capable backing, including
+    /// its initialized writable padding. [`Self::data_size`] and host-facing
+    /// slices retain the logical 65536-byte length. Use this with
+    /// [`Self::data_ptr`] only for trusted snapshots while Wasm is not running.
+    pub fn psizam_memory16_data_size(&self, store: impl AsContext) -> Option<usize> {
+        self.ty(store)
+            .wasmtime_memory()
+            .is_psizam_memory16()
+            .then_some(wasmtime_environ::PSIZAM_MEMORY16_ACCESSIBLE_BYTES)
+    }
+
     pub(crate) fn internal_data_size(&self, store: &StoreOpaque) -> usize {
         store[self.instance].memory(self.index).current_length()
     }

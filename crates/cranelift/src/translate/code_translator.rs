@@ -71,6 +71,7 @@
 //!   <https://github.com/bytecodealliance/cranelift/pull/1236>
 //!     ("Relax verification to allow I8X16 to act as a default vector type")
 
+use crate::bounds_checks::compute_addr;
 use crate::bounds_checks::{BoundsCheck, bounds_check_and_compute_addr};
 use crate::func_environ::{Extension, FuncEnvironment};
 use crate::translate::TargetEnvironment;
@@ -1435,12 +1436,19 @@ pub fn translate_operator(
                 MemArgTarget::Memory(index) => MemoryIndex::from_u32(index),
                 MemArgTarget::Array(_) => return Err(wasm_unsupported!("should not be valid")),
             };
+            if environ.memory(memory_index).is_psizam_memory16() && memarg.offset > 65535 {
+                return Err(wasm_unsupported!("memory16 atomic offset exceeds 65535"));
+            }
             let heap = environ.get_or_create_heap(builder.func, memory_index);
             let timeout = environ.stacks.pop1(); // 64 (fixed)
             let expected = environ.stacks.pop1(); // 32 or 64 (per the `Ixx` in `IxxAtomicWait`)
             assert!(builder.func.dfg.value_type(expected) == implied_ty);
             let addr = environ.stacks.pop1();
-            let effective_addr = if memarg.offset == 0 {
+            let effective_addr = if environ.memory(memory_index).is_psizam_memory16() {
+                let masked = builder.ins().band_imm_u(addr, 65535);
+                let offset = builder.ins().iconst(I32, memarg.offset as i64);
+                builder.ins().iadd(masked, offset)
+            } else if memarg.offset == 0 {
                 addr
             } else {
                 let index_type = environ.heaps()[heap].index_type();
@@ -1464,10 +1472,17 @@ pub fn translate_operator(
                 MemArgTarget::Memory(index) => MemoryIndex::from_u32(index),
                 MemArgTarget::Array(_) => return Err(wasm_unsupported!("should not be valid")),
             };
+            if environ.memory(memory_index).is_psizam_memory16() && memarg.offset > 65535 {
+                return Err(wasm_unsupported!("memory16 atomic offset exceeds 65535"));
+            }
             let heap = environ.get_or_create_heap(builder.func, memory_index);
             let count = environ.stacks.pop1(); // 32 (fixed)
             let addr = environ.stacks.pop1();
-            let effective_addr = if memarg.offset == 0 {
+            let effective_addr = if environ.memory(memory_index).is_psizam_memory16() {
+                let masked = builder.ins().band_imm_u(addr, 65535);
+                let offset = builder.ins().iconst(I32, memarg.offset as i64);
+                builder.ins().iadd(masked, offset)
+            } else if memarg.offset == 0 {
                 addr
             } else {
                 let index_type = environ.heaps()[heap].index_type();
@@ -3705,68 +3720,93 @@ fn prepare_addr(
     // `heap_addr` instruction plus a hardcoded i32-offset in memory-related
     // instructions.
     let heap = environ.heaps()[heap].clone();
-    let addr = match u32::try_from(memarg.offset) {
-        // If our offset fits within a u32, then we can place the it into the
-        // offset immediate of the `heap_addr` instruction.
-        Ok(offset) => bounds_check_and_compute_addr(
-            builder,
-            environ,
+    let addr = if heap.memory.is_psizam_memory16() {
+        if memarg.offset > 65535 || access_size > 16 {
+            return Err(wasm_unsupported!(
+                "memory16 access exceeds its validated padding"
+            ));
+        }
+        // The mask belongs between the dynamic i32 expression and the static
+        // offset. The instance owns all 131086 possible accessed bytes.
+        let masked = builder.ins().band_imm_u(index, 65535);
+        let pointer_ty = environ.pointer_type();
+        let masked = if builder.func.dfg.value_type(masked) == pointer_ty {
+            masked
+        } else {
+            builder.ins().uextend(pointer_ty, masked)
+        };
+        Reachability::Reachable(compute_addr(
+            &mut builder.cursor(),
             &heap,
-            index,
-            BoundsCheck::StaticOffset {
-                offset,
-                access_size,
-            },
-            ir::TrapCode::HEAP_OUT_OF_BOUNDS,
-        ),
-
-        // If the offset doesn't fit within a u32, then we can't pass it
-        // directly into `heap_addr`.
-        //
-        // One reasonable question you might ask is "why not?". There's no
-        // fundamental reason why `heap_addr` *must* take a 32-bit offset. The
-        // reason this isn't done, though, is that blindly changing the offset
-        // to a 64-bit offset increases the size of the `InstructionData` enum
-        // in cranelift by 8 bytes (16 to 24). This can have significant
-        // performance implications so the conclusion when this was written was
-        // that we shouldn't do that.
-        //
-        // Without the ability to put the whole offset into the `heap_addr`
-        // instruction we need to fold the offset into the address itself with
-        // an unsigned addition. In doing so though we need to check for
-        // overflow because that would mean the address is out-of-bounds (wasm
-        // bounds checks happen on the effective 33 or 65 bit address once the
-        // offset is factored in).
-        //
-        // Once we have the effective address, offset already folded in, then
-        // `heap_addr` is used to verify that the address is indeed in-bounds.
-        //
-        // Note that this is generating what's likely to be at least two
-        // branches, one for the overflow and one for the bounds check itself.
-        // For now though that should hopefully be ok since 4gb+ offsets are
-        // relatively odd/rare. In the future if needed we can look into
-        // optimizing this more.
-        Err(_) => {
-            let offset = builder
-                .ins()
-                .iconst(heap.index_type(), memarg.offset.cast_signed());
-            let adjusted_index = environ.uadd_overflow_trap(
-                builder,
-                index,
-                offset,
-                ir::TrapCode::HEAP_OUT_OF_BOUNDS,
-            );
-            bounds_check_and_compute_addr(
+            pointer_ty,
+            masked,
+            memarg.offset as u32,
+            None,
+        ))
+    } else {
+        match u32::try_from(memarg.offset) {
+            // If our offset fits within a u32, then we can place the it into the
+            // offset immediate of the `heap_addr` instruction.
+            Ok(offset) => bounds_check_and_compute_addr(
                 builder,
                 environ,
                 &heap,
-                adjusted_index,
+                index,
                 BoundsCheck::StaticOffset {
-                    offset: 0,
+                    offset,
                     access_size,
                 },
                 ir::TrapCode::HEAP_OUT_OF_BOUNDS,
-            )
+            ),
+
+            // If the offset doesn't fit within a u32, then we can't pass it
+            // directly into `heap_addr`.
+            //
+            // One reasonable question you might ask is "why not?". There's no
+            // fundamental reason why `heap_addr` *must* take a 32-bit offset. The
+            // reason this isn't done, though, is that blindly changing the offset
+            // to a 64-bit offset increases the size of the `InstructionData` enum
+            // in cranelift by 8 bytes (16 to 24). This can have significant
+            // performance implications so the conclusion when this was written was
+            // that we shouldn't do that.
+            //
+            // Without the ability to put the whole offset into the `heap_addr`
+            // instruction we need to fold the offset into the address itself with
+            // an unsigned addition. In doing so though we need to check for
+            // overflow because that would mean the address is out-of-bounds (wasm
+            // bounds checks happen on the effective 33 or 65 bit address once the
+            // offset is factored in).
+            //
+            // Once we have the effective address, offset already folded in, then
+            // `heap_addr` is used to verify that the address is indeed in-bounds.
+            //
+            // Note that this is generating what's likely to be at least two
+            // branches, one for the overflow and one for the bounds check itself.
+            // For now though that should hopefully be ok since 4gb+ offsets are
+            // relatively odd/rare. In the future if needed we can look into
+            // optimizing this more.
+            Err(_) => {
+                let offset = builder
+                    .ins()
+                    .iconst(heap.index_type(), memarg.offset.cast_signed());
+                let adjusted_index = environ.uadd_overflow_trap(
+                    builder,
+                    index,
+                    offset,
+                    ir::TrapCode::HEAP_OUT_OF_BOUNDS,
+                );
+                bounds_check_and_compute_addr(
+                    builder,
+                    environ,
+                    &heap,
+                    adjusted_index,
+                    BoundsCheck::StaticOffset {
+                        offset: 0,
+                        access_size,
+                    },
+                    ir::TrapCode::HEAP_OUT_OF_BOUNDS,
+                )
+            }
         }
     };
     let addr = match addr {
@@ -3823,6 +3863,17 @@ fn align_atomic_addr(
     }
 }
 
+// Private memory16 operations have single-thread byte semantics. Ordinary
+// Wasm memories keep their atomic alignment checks and native atomic lowering.
+fn memory16_access(memarg: &MemArg, environ: &FuncEnvironment<'_>) -> bool {
+    match memarg.target {
+        MemArgTarget::Memory(index) => environ
+            .memory(MemoryIndex::from_u32(index))
+            .is_psizam_memory16(),
+        MemArgTarget::Array(_) => false,
+    }
+}
+
 /// Like `prepare_addr` but for atomic accesses.
 ///
 /// Returns `None` when the Wasm access will unconditionally trap.
@@ -3835,7 +3886,9 @@ fn prepare_atomic_addr(
     if memarg.ordering.is_some() {
         return Err(wasm_unsupported!("acquire-release-atomics"));
     }
-    align_atomic_addr(memarg, loaded_bytes, builder, environ);
+    if !memory16_access(memarg, environ) {
+        align_atomic_addr(memarg, loaded_bytes, builder, environ);
+    }
     prepare_addr(memarg, loaded_bytes, builder, environ)
 }
 
@@ -3949,7 +4002,26 @@ fn translate_atomic_rmw(
         )?
     );
 
-    let mut res = builder.ins().atomic_rmw(access_ty, flags, op, addr, arg2);
+    let mut res = if memory16_access(memarg, environ) {
+        let old = builder.ins().load(access_ty, flags, addr, 0);
+        let next = match op {
+            AtomicRmwOp::Add => builder.ins().iadd(old, arg2),
+            AtomicRmwOp::Sub => builder.ins().isub(old, arg2),
+            AtomicRmwOp::And => builder.ins().band(old, arg2),
+            AtomicRmwOp::Or => builder.ins().bor(old, arg2),
+            AtomicRmwOp::Xor => builder.ins().bxor(old, arg2),
+            AtomicRmwOp::Xchg => arg2,
+            _ => {
+                return Err(wasm_unsupported!(
+                    "unsupported private memory16 atomic operation"
+                ));
+            }
+        };
+        builder.ins().store(flags, next, addr, 0);
+        old
+    } else {
+        builder.ins().atomic_rmw(access_ty, flags, op, addr, arg2)
+    };
     if access_ty != widened_ty {
         res = builder.ins().uextend(widened_ty, res);
     }
@@ -4003,7 +4075,15 @@ fn translate_atomic_cas(
             environ,
         )?
     );
-    let mut res = builder.ins().atomic_cas(flags, addr, expected, replacement);
+    let mut res = if memory16_access(memarg, environ) {
+        let old = builder.ins().load(access_ty, flags, addr, 0);
+        let equal = builder.ins().icmp(IntCC::Equal, old, expected);
+        let next = builder.ins().select(equal, replacement, old);
+        builder.ins().store(flags, next, addr, 0);
+        old
+    } else {
+        builder.ins().atomic_cas(flags, addr, expected, replacement)
+    };
     if access_ty != widened_ty {
         res = builder.ins().uextend(widened_ty, res);
     }
@@ -4044,7 +4124,11 @@ fn translate_atomic_load(
             environ,
         )?
     );
-    let mut res = builder.ins().atomic_load(access_ty, flags, addr);
+    let mut res = if memory16_access(memarg, environ) {
+        builder.ins().load(access_ty, flags, addr, 0)
+    } else {
+        builder.ins().atomic_load(access_ty, flags, addr)
+    };
     if access_ty != widened_ty {
         res = builder.ins().uextend(widened_ty, res);
     }
@@ -4091,7 +4175,11 @@ fn translate_atomic_store(
             environ,
         )?
     );
-    builder.ins().atomic_store(flags, data, addr);
+    if memory16_access(memarg, environ) {
+        builder.ins().store(flags, data, addr, 0);
+    } else {
+        builder.ins().atomic_store(flags, data, addr);
+    }
     Ok(())
 }
 

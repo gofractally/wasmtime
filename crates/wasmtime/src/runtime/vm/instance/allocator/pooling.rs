@@ -578,6 +578,9 @@ unsafe impl InstanceAllocator for PoolingInstanceAllocator {
     }
 
     fn validate_module(&self, module: &Module, offsets: &VMOffsets<HostPtr>) -> Result<()> {
+        if module.memories.values().any(|m| m.is_psizam_memory16()) {
+            bail!("memory16 is not supported by the pooling allocator");
+        }
         self.validate_memory_plans(module)
             .context("module memory does not fit in pooling allocator requirements")?;
         self.validate_table_plans(module)

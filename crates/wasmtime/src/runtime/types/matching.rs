@@ -141,6 +141,9 @@ fn table_ty(expected: &Table, actual: &Table, actual_runtime_size: Option<u64>) 
 }
 
 fn memory_ty(expected: &Memory, actual: &Memory, actual_runtime_size: Option<u64>) -> Result<()> {
+    if expected.psizam_execution_profile != actual.psizam_execution_profile {
+        bail!("memory types incompatible: psizam execution profiles differ");
+    }
     match_bool(
         expected.shared,
         actual.shared,
