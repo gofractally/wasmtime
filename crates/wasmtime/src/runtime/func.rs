@@ -2074,6 +2074,16 @@ impl<T> Caller<'_, T> {
         self.caller.get_export(&mut self.store, name)
     }
 
+    /// Return actual caller memory0 only when it uses memory16-v1 backing.
+    ///
+    /// This trusted-host API also handles imported or unexported memory and
+    /// calls made during the caller's start function. It returns `None` for
+    /// ordinary memories or host calls without a memory16 caller. Logical
+    /// memory APIs still exclude private padding.
+    pub fn psizam_memory16_memory(&self) -> Option<crate::Memory> {
+        self.caller.psizam_memory16_memory(&self.store)
+    }
+
     /// Looks up an exported [`Extern`] value by a [`ModuleExport`] value.
     ///
     /// This is similar to [`Self::get_export`] but uses a [`ModuleExport`]

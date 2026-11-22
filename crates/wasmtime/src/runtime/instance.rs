@@ -9,8 +9,8 @@ use crate::store::{
 };
 use crate::types::matching;
 use crate::{
-    AsContextMut, Engine, Export, Extern, Func, Global, Memory, Module, ModuleExport, SharedMemory,
-    StoreContext, StoreContextMut, Table, Tag, TypedFunc,
+    AsContext, AsContextMut, Engine, Export, Extern, Func, Global, Memory, Module, ModuleExport,
+    SharedMemory, StoreContext, StoreContextMut, Table, Tag, TypedFunc,
 };
 use alloc::sync::Arc;
 use core::ptr::NonNull;
@@ -481,6 +481,27 @@ impl Instance {
             instance.get_export_by_index_mut(registry, id, entity)
         };
         Extern::from_wasmtime_export(export, store.engine())
+    }
+
+    /// Return memory0 only when it has actual memory16-v1 backing.
+    ///
+    /// This trusted-host API also resolves imported or unexported memory and
+    /// returns `None` for ordinary memories or an instance without memory.
+    /// Logical memory views remain 65536 bytes; use the memory's separate
+    /// private-state length API for complete snapshots.
+    pub fn psizam_memory16_memory(&self, store: impl AsContext) -> Option<Memory> {
+        let store = store.as_context();
+        let instance = &store.0[self.id];
+        let index = MemoryIndex::from_u32(0);
+        if !instance
+            .env_module()
+            .memories
+            .get(index)?
+            .is_psizam_memory16()
+        {
+            return None;
+        }
+        instance.get_exported_memory(store.0.id(), index).unshared()
     }
 
     /// Looks up an exported [`Func`] value by name.

@@ -5,7 +5,9 @@ use crate::{
 };
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicUsize, Ordering};
-use wasmtime_environ::{PSIZAM_MEMORY16_ACCESSIBLE_BYTES, PSIZAM_MEMORY16_P16};
+use wasmtime_environ::{
+    PSIZAM_MEMORY16_ACCESSIBLE_BYTES, PSIZAM_MEMORY16_P16, PSIZAM_MEMORY16_P32,
+};
 
 fn module_bytes(text: &str, profile: Option<u32>) -> Vec<u8> {
     let mut bytes = wat::parse_str(text).unwrap();
@@ -88,7 +90,7 @@ fn psizam_memory16_import_requires_explicit_capable_backing() -> Result<()> {
         ),
     )?;
     let mut store = Store::new(&engine, ());
-    let ordinary = Memory::new(&mut store, MemoryType::new(1, Some(1)))?;
+    let ordinary = Memory::new(&mut store, MemoryType::new(1, Some(1))?)?;
     assert!(Instance::new(&mut store, &module, &[Extern::Memory(ordinary)]).is_err());
     let capable = MemoryType::builder()
         .min(1)
@@ -131,6 +133,61 @@ fn psizam_memory16_rejects_custom_creator_before_allocation() -> Result<()> {
         .is_err()
     );
     assert_eq!(calls.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
+fn psizam_memory16_actual_unexported_memory_during_start() -> Result<()> {
+    for (force, profile, expected) in [
+        (false, None, false),
+        (false, Some(PSIZAM_MEMORY16_P16), true),
+        (false, Some(PSIZAM_MEMORY16_P32), true),
+        (true, None, true),
+        (true, Some(PSIZAM_MEMORY16_P16), true),
+        (true, Some(PSIZAM_MEMORY16_P32), true),
+    ] {
+        let engine = engine(force)?;
+        let bytes = module_bytes(
+            r#"(module
+                (import "env" "observe" (func $observe))
+                (memory 1 1)
+                (data (i32.const 0) "*")
+                (func $start call $observe)
+                (start $start)
+                (func (export "again") call $observe))"#,
+            profile,
+        );
+        let module = Module::new(&engine, bytes)?;
+        let mut store = Store::new(&engine, Vec::<Option<(usize, usize, u8)>>::new());
+        let observe = crate::Func::wrap(
+            &mut store,
+            |mut caller: crate::Caller<'_, Vec<Option<(usize, usize, u8)>>>| {
+                assert!(caller.get_export("memory").is_none());
+                let record = caller.psizam_memory16_memory().map(|memory| {
+                    (
+                        memory.data_size(&caller),
+                        memory.psizam_memory16_data_size(&caller).unwrap(),
+                        memory.data(&caller)[0],
+                    )
+                });
+                caller.data_mut().push(record);
+            },
+        );
+        let instance = Instance::new(&mut store, &module, &[observe.into()])?;
+        assert!(instance.get_memory(&mut store, "memory").is_none());
+        let memory = instance.psizam_memory16_memory(&store);
+        assert_eq!(memory.is_some(), expected);
+        if let Some(memory) = memory {
+            assert_eq!(memory.data_size(&store), 65536);
+            assert_eq!(memory.psizam_memory16_data_size(&store), Some(131086));
+            assert_eq!(memory.data(&store)[0], 42);
+        }
+        instance
+            .get_typed_func::<(), ()>(&mut store, "again")?
+            .call(&mut store, ())?;
+        let wanted = expected.then_some((65536, 131086, 42));
+        assert_eq!(store.data().as_slice(), &[wanted, wanted]);
+    }
     Ok(())
 }
 

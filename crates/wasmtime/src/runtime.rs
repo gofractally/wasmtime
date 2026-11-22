@@ -32,7 +32,7 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 
 mod bug;
-#[cfg(all(test, feature = "cranelift"))]
+#[cfg(all(test, feature = "cranelift", feature = "wat"))]
 mod psizam_memory16_tests;
 
 #[macro_use]
