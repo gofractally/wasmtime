@@ -2084,6 +2084,15 @@ impl<T> Caller<'_, T> {
         self.caller.psizam_memory16_memory(&self.store)
     }
 
+    /// Return actual caller memory0 and whether it uses memory16-v1 backing.
+    ///
+    /// Unlike [`Self::psizam_memory16_memory`] this also resolves an ordinary
+    /// memory, exported or not, so a host called from a start function can
+    /// reach its caller's memory under either profile.
+    pub fn psizam_memory0(&self) -> Option<(crate::Memory, bool)> {
+        self.caller.psizam_memory0(&self.store)
+    }
+
     /// Looks up an exported [`Extern`] value by a [`ModuleExport`] value.
     ///
     /// This is similar to [`Self::get_export`] but uses a [`ModuleExport`]

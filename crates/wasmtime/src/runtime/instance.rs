@@ -504,6 +504,28 @@ impl Instance {
         instance.get_exported_memory(store.0.id(), index).unshared()
     }
 
+    /// Return memory0 and whether it has memory16-v1 backing.
+    ///
+    /// A host callback needs its caller's memory whether or not the module
+    /// exports it, including during the caller's start function, when no
+    /// embedder-side cache of the instance exists yet. This trusted-host API
+    /// resolves it for ordinary and memory16 memories alike; it returns
+    /// `None` for an instance without memory or with a shared one.
+    pub fn psizam_memory0(&self, store: impl AsContext) -> Option<(Memory, bool)> {
+        let store = store.as_context();
+        let instance = &store.0[self.id];
+        let index = MemoryIndex::from_u32(0);
+        let memory16 = instance
+            .env_module()
+            .memories
+            .get(index)?
+            .is_psizam_memory16();
+        instance
+            .get_exported_memory(store.0.id(), index)
+            .unshared()
+            .map(|memory| (memory, memory16))
+    }
+
     /// Looks up an exported [`Func`] value by name.
     ///
     /// Returns `None` if there was no export named `name`, or if there was but

@@ -191,6 +191,50 @@ fn psizam_memory16_actual_unexported_memory_during_start() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn psizam_memory0_resolves_unexported_memory_under_either_profile() -> Result<()> {
+    let engine = engine(false)?;
+    for (profile, memory16) in [(None, false), (Some(PSIZAM_MEMORY16_P32), true)] {
+        let bytes = module_bytes(
+            r#"(module
+                (import "env" "observe" (func $observe))
+                (memory 1 1)
+                (data (i32.const 0) "*")
+                (func $start call $observe)
+                (start $start)
+                (func (export "again") call $observe))"#,
+            profile,
+        );
+        let module = Module::new(&engine, bytes)?;
+        let mut store = Store::new(&engine, Vec::<Option<(usize, bool, u8)>>::new());
+        let observe = crate::Func::wrap(
+            &mut store,
+            |mut caller: crate::Caller<'_, Vec<Option<(usize, bool, u8)>>>| {
+                assert!(caller.get_export("memory").is_none());
+                let record = caller
+                    .psizam_memory0()
+                    .map(|(memory, is16)| (memory.data_size(&caller), is16, memory.data(&caller)[0]));
+                caller.data_mut().push(record);
+            },
+        );
+        let instance = Instance::new(&mut store, &module, &[observe.into()])?;
+        let (memory, is16) = instance.psizam_memory0(&store).unwrap();
+        assert_eq!(is16, memory16);
+        assert_eq!(memory.data_size(&store), 65536);
+        instance
+            .get_typed_func::<(), ()>(&mut store, "again")?
+            .call(&mut store, ())?;
+        let wanted = Some((65536, memory16, 42));
+        assert_eq!(store.data().as_slice(), &[wanted, wanted]);
+    }
+    let bytes = module_bytes("(module)", None);
+    let module = Module::new(&engine, bytes)?;
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[])?;
+    assert!(instance.psizam_memory0(&store).is_none());
+    Ok(())
+}
+
 #[cfg(feature = "winch")]
 #[test]
 fn psizam_memory16_rejects_unsupported_winch_compilation() -> Result<()> {
