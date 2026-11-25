@@ -1,7 +1,30 @@
-//! Admission for psizam's explicitly selected memory16-v1 execution profile.
+//! Admission for psizam's explicitly selected memory16-v1 execution profile,
+//! and the per-function costs of psizam's deterministic stack budget.
+//!
+//! # The stack budget
+//!
+//! How much native stack a wasm frame takes depends on the compiler, so the
+//! native stack limit cannot decide which call overflows on a chain where
+//! every node must agree. psizam charges each function a fixed number of
+//! bytes computed from the wasm itself. With `Tunables::psizam_stack_meter`
+//! the embedder supplies those costs in a `psizam.stack-costs` custom section
+//! (one little-endian `u32` per defined function, in order) and compiled code
+//! enforces them:
+//!
+//! * every wasm function takes the bytes remaining as one extra, trailing
+//!   argument, traps with a stack overflow if that is less than its own
+//!   cost, and passes the difference to whatever it calls;
+//! * a host-to-wasm entry trampoline reads the starting value from
+//!   `VMStoreContext::psizam_stack_remaining` and puts it back when the call
+//!   returns;
+//! * a wasm-to-host trampoline stores the value its caller passed, so that
+//!   the host sees what remains and may set what a re-entrant call starts
+//!   with.
+//!
+//! Nothing is loaded or stored on a wasm-to-wasm call or on a return.
 
 use crate::error::{Result, bail};
-use crate::{Memory, PSIZAM_MEMORY16_P16, PSIZAM_MEMORY16_P32};
+use crate::{DefinedFuncIndex, Memory, PSIZAM_MEMORY16_P16, PSIZAM_MEMORY16_P32, PrimaryMap};
 use wasmparser::{MemArgTarget, Operator, Parser, Payload, TypeRef};
 
 /// Resolve and validate a core module's declared/default execution profile.
@@ -182,5 +205,39 @@ mod tests {
             )
             .is_ok()
         );
+    }
+}
+
+/// The name of the custom section that carries psizam's stack costs.
+pub const PSIZAM_STACK_COSTS_SECTION: &str = "psizam.stack-costs";
+
+/// Reads the stack cost of each of a module's `defined` functions.
+///
+/// The section must be present exactly once and hold exactly one cost per
+/// defined function: a module compiled for metering never runs unmetered.
+pub fn psizam_stack_costs(data: &[u8], defined: usize) -> Result<PrimaryMap<DefinedFuncIndex, u32>> {
+    let mut costs = None;
+    for payload in Parser::new(0).parse_all(data) {
+        if let Payload::CustomSection(section) = payload? {
+            if section.name() != PSIZAM_STACK_COSTS_SECTION {
+                continue;
+            }
+            if costs.is_some() {
+                bail!("duplicate psizam.stack-costs section");
+            }
+            let bytes = section.data();
+            if bytes.len() % 4 != 0 || bytes.len() / 4 != defined {
+                bail!("psizam.stack-costs does not have one cost per defined function");
+            }
+            let mut map = PrimaryMap::with_capacity(defined);
+            for cost in bytes.chunks_exact(4) {
+                map.push(u32::from_le_bytes(cost.try_into().unwrap()));
+            }
+            costs = Some(map);
+        }
+    }
+    match costs {
+        Some(costs) => Ok(costs),
+        None => bail!("stack metering requires a psizam.stack-costs section"),
     }
 }

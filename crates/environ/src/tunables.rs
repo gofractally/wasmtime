@@ -63,6 +63,9 @@ define_tunables! {
     pub struct Tunables {
         /// Select memory16-v1/p32 for source without a declared profile.
         pub psizam_memory16: bool,
+        /// Enforce psizam's deterministic stack budget in every function's
+        /// prologue. See `crates/environ/src/psizam.rs`.
+        pub psizam_stack_meter: bool,
         /// The garbage collector implementation to use, which implies the layout of
         /// GC objects and barriers that must be emitted in Wasm code.
         pub collector: Option<Collector>,
@@ -260,6 +263,7 @@ impl Tunables {
     pub fn default_miri() -> Tunables {
         Tunables {
             psizam_memory16: false,
+            psizam_stack_meter: false,
             collector: None,
 
             // No virtual memory tricks are available on miri so make these

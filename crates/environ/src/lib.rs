@@ -10,6 +10,9 @@
 #![deny(missing_docs)]
 #![warn(clippy::cast_sign_loss)]
 #![no_std]
+// `define_vm_type_offsets!` walks a struct's fields recursively, and
+// `VMStoreContext` has one more field than the default limit allows.
+#![recursion_limit = "256"]
 
 #[cfg(any(feature = "std", test))]
 #[macro_use]
@@ -63,7 +66,9 @@ pub use crate::key::*;
 pub use crate::module::*;
 pub use crate::module_artifacts::*;
 pub use crate::module_types::*;
-pub use crate::psizam::psizam_execution_profile;
+pub use crate::psizam::{
+    PSIZAM_STACK_COSTS_SECTION, psizam_execution_profile, psizam_stack_costs,
+};
 pub use crate::ref_bits::*;
 pub use crate::scopevec::ScopeVec;
 pub use crate::stack_map::*;

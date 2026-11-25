@@ -1031,6 +1031,7 @@ impl Default for VMStoreContext {
             fuel_consumed: UnsafeCell::new(0),
             epoch_deadline: UnsafeCell::new(0),
             execution_version: 0,
+            psizam_stack_remaining: UnsafeCell::new(0),
             stack_limit: UnsafeCell::new(usize::MAX),
             gc_heap: UnsafeCell::new(VMMemoryDefinition {
                 base: NonNull::dangling().into(),

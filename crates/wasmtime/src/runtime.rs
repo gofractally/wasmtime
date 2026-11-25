@@ -34,6 +34,8 @@ use core::task::{Context, Poll};
 mod bug;
 #[cfg(all(test, feature = "cranelift", feature = "wat"))]
 mod psizam_memory16_tests;
+#[cfg(all(test, feature = "cranelift", feature = "wat"))]
+mod psizam_stack_meter_tests;
 
 #[macro_use]
 pub(crate) mod func;

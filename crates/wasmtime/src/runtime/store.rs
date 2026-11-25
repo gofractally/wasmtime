@@ -1130,6 +1130,23 @@ impl<T> Store<T> {
         self.inner.set_epoch_deadline(ticks_beyond_current);
     }
 
+    /// The bytes of psizam's deterministic stack budget that remain.
+    ///
+    /// While a host function runs this is what remained for it when wasm
+    /// called it. Otherwise it is the value last set. Meaningful only with
+    /// [`Config::psizam_stack_meter`](crate::Config::psizam_stack_meter).
+    pub fn psizam_stack_remaining(&self) -> u64 {
+        self.inner.psizam_stack_remaining()
+    }
+
+    /// Sets the stack budget the next call into wasm starts with.
+    ///
+    /// A call into wasm leaves this value as it found it, however the call
+    /// ends. See [`Store::psizam_stack_remaining`].
+    pub fn psizam_set_stack_remaining(&mut self, bytes: u64) {
+        self.inner.psizam_set_stack_remaining(bytes);
+    }
+
     /// Configures epoch-deadline expiration to trap.
     ///
     /// When epoch-interruption-instrumented code is executed on this
@@ -1377,6 +1394,16 @@ impl<'a, T> StoreContextMut<'a, T> {
     #[cfg(target_has_atomic = "64")]
     pub fn set_epoch_deadline(&mut self, ticks_beyond_current: u64) {
         self.0.set_epoch_deadline(ticks_beyond_current);
+    }
+
+    /// See [`Store::psizam_stack_remaining`].
+    pub fn psizam_stack_remaining(&self) -> u64 {
+        self.0.psizam_stack_remaining()
+    }
+
+    /// See [`Store::psizam_set_stack_remaining`].
+    pub fn psizam_set_stack_remaining(&mut self, bytes: u64) {
+        self.0.psizam_set_stack_remaining(bytes);
     }
 
     /// Configures epoch-deadline expiration to trap.
@@ -1890,6 +1917,16 @@ impl StoreOpaque {
     #[inline]
     pub fn vm_store_context_mut(&mut self) -> &mut VMStoreContext {
         &mut self.vm_store_context
+    }
+
+    pub(crate) fn psizam_stack_remaining(&self) -> u64 {
+        // SAFETY: the field is only written by this store's own thread, by
+        // compiled code or by `psizam_set_stack_remaining`.
+        unsafe { *self.vm_store_context.psizam_stack_remaining.get() }
+    }
+
+    pub(crate) fn psizam_set_stack_remaining(&mut self, bytes: u64) {
+        *self.vm_store_context.psizam_stack_remaining.get_mut() = bytes;
     }
 
     /// Attempts to access the GC store that has been previously allocated.

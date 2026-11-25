@@ -389,6 +389,15 @@ macro_rules! for_each_vm_type {
                 /// This field is in use only if guest debugging is enabled.
                 pub execution_version: u64,
 
+                /// Bytes of psizam's deterministic stack budget that remain.
+                ///
+                /// Compiled wasm functions carry the running value in a
+                /// register; this field is only read by host-to-wasm entry
+                /// trampolines and written by wasm-to-host trampolines. See
+                /// `crates/environ/src/psizam.rs`. In use only with
+                /// `Tunables::psizam_stack_meter`.
+                pub psizam_stack_remaining: UnsafeCell<u64>,
+
                 /// Current stack limit of the wasm module.
                 ///
                 /// For more information see `crates/cranelift/src/lib.rs`.

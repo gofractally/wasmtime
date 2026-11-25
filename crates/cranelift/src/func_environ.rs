@@ -26,6 +26,7 @@ use cranelift_entity::{EntityRef, PrimaryMap, SecondaryMap};
 use cranelift_frontend::Variable;
 use cranelift_frontend::{FuncInstBuilder, FunctionBuilder};
 use smallvec::{SmallVec, smallvec};
+use std::borrow::Cow;
 use std::iter::Peekable;
 use std::marker::PhantomData;
 use std::mem;
@@ -242,6 +243,13 @@ pub struct FuncEnvironment<'module_environment> {
     /// into the host to trap when signal handlers are disabled.
     pub(crate) stack_limit_at_function_entry: Option<VmctxLoadChain>,
 
+    /// psizam's stack budget in this function, under
+    /// `Tunables::psizam_stack_meter`: the bytes that remained when it was
+    /// called, and what remains for the functions it calls. A tail call
+    /// replaces this frame, so it passes on the first; any other call passes
+    /// the second.
+    psizam_stack_budget: Option<(ir::Value, ir::Value)>,
+
     /// Function-local support for translating stack-switching operations.
     stack_switching: StackSwitchingSupport,
 
@@ -322,6 +330,7 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
             translation,
 
             stack_limit_at_function_entry: None,
+            psizam_stack_budget: None,
 
             stack_switching: StackSwitchingSupport::default(),
 
@@ -2581,7 +2590,21 @@ impl<'a, 'func, 'module_env> Call<'a, 'func, 'module_env> {
         }
     }
 
+    /// The arguments of a wasm call as the calling convention takes them:
+    /// with psizam's stack budget appended when it is metered.
+    fn with_stack_budget<'b>(&self, args: &'b [ir::Value]) -> Cow<'b, [ir::Value]> {
+        match self.env.psizam_stack_budget {
+            Some((entry, after)) => {
+                let mut args = args.to_vec();
+                args.push(if self.tail { entry } else { after });
+                Cow::Owned(args)
+            }
+            None => Cow::Borrowed(args),
+        }
+    }
+
     fn direct_call_inst(&mut self, callee: ir::FuncRef, args: &[ir::Value]) -> CallRets {
+        let args = &*self.with_stack_budget(args);
         let sig_ref = self.builder.func.dfg.ext_funcs[callee].signature;
         if self.tail {
             self.builder.ins().return_call(callee, args);
@@ -2610,6 +2633,7 @@ impl<'a, 'func, 'module_env> Call<'a, 'func, 'module_env> {
         func_addr: ir::Value,
         args: &[ir::Value],
     ) -> CallRets {
+        let args = &*self.with_stack_budget(args);
         if self.tail {
             self.builder
                 .ins()
@@ -2687,12 +2711,12 @@ impl FuncEnvironment<'_> {
 
     pub fn is_wasm_parameter(&self, index: usize) -> bool {
         // The first two parameters are the vmctx and caller vmctx. The rest are
-        // the wasm parameters.
-        index >= 2
+        // the wasm parameters, then psizam's stack budget if it is metered.
+        index >= 2 && index - 2 < self.wasm_func_ty.params().len()
     }
 
     pub fn clif_param_as_wasm_param(&self, index: usize) -> Option<WasmValType> {
-        if index >= 2 {
+        if self.is_wasm_parameter(index) {
             Some(self.wasm_func_ty.params()[index - 2])
         } else {
             None
@@ -2700,8 +2724,8 @@ impl FuncEnvironment<'_> {
     }
 
     pub fn param_needs_stack_map(&self, _signature: &ir::Signature, index: usize) -> bool {
-        // Skip the caller and callee vmctx.
-        if index < 2 {
+        // Skip the caller and callee vmctx, and psizam's stack budget.
+        if !self.is_wasm_parameter(index) {
             return false;
         }
 
@@ -5466,6 +5490,32 @@ impl FuncEnvironment<'_> {
             let sp = builder.ins().get_stack_pointer(self.pointer_type());
             let overflow = builder.ins().icmp(IntCC::UnsignedLessThan, sp, limit);
             self.conditionally_trap(builder, overflow, ir::TrapCode::STACK_OVERFLOW);
+        }
+
+        // psizam's deterministic stack budget: this function's cost comes out
+        // of what the caller passed, or the call does not happen.
+        if self.tunables.psizam_stack_meter {
+            let entry = builder.func.layout.entry_block().unwrap();
+            let remaining = *builder.func.dfg.block_params(entry).last().unwrap();
+            let cost = match self.key {
+                FuncKey::DefinedWasmFunction(_, index) => {
+                    self.translation.psizam_stack_costs.as_ref().unwrap()[index]
+                }
+                // Functions the compiler synthesizes are not charged.
+                _ => 0,
+            };
+            let after = if cost == 0 {
+                remaining
+            } else {
+                let overflow = builder.ins().icmp_imm_u(
+                    IntCC::UnsignedLessThan,
+                    remaining,
+                    i64::from(cost),
+                );
+                self.trapnz(builder, overflow, ir::TrapCode::STACK_OVERFLOW);
+                builder.ins().iadd_imm_s(remaining, -i64::from(cost))
+            };
+            self.psizam_stack_budget = Some((remaining, after));
         }
 
         self.update_state_slot_vmctx(builder);

@@ -298,6 +298,7 @@ impl Metadata<'_> {
             // saved modules carry their resolved profile. Module admission
             // enforces the asymmetric override rule after metadata is read.
             psizam_memory16: _,
+            psizam_stack_meter,
             collector,
             memory_reservation,
             memory_guard_size,
@@ -373,6 +374,11 @@ impl Metadata<'_> {
             "native debug information support",
         )?;
         Self::check_bool(debug_guest, other.debug_guest, "guest debug")?;
+        Self::check_bool(
+            psizam_stack_meter,
+            other.psizam_stack_meter,
+            "psizam stack metering",
+        )?;
         Self::check_bool(debug_symbols, other.debug_symbols, "debug symbols")?;
         Self::check_bool(
             parse_wasm_debuginfo,

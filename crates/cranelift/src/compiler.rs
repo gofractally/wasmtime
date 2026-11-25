@@ -243,12 +243,25 @@ impl Compiler {
             vm_store_context,
         );
 
+        // Leaving wasm: the host can now read what remains of psizam's stack
+        // budget, and set what a call back into wasm starts with.
+        let wasm_args = if self.tunables.psizam_stack_meter {
+            let (budget, wasm_args) = args[2..].split_last().unwrap();
+            alias_regions
+                .vm_store_context()
+                .psizam_stack_remaining()
+                .store(&mut builder.cursor(), vm_store_context, *budget);
+            wasm_args
+        } else {
+            &args[2..]
+        };
+
         // Spill all wasm arguments to the stack in `ValRaw` slots.
         let (args_base, args_len) = self.allocate_stack_array_and_spill_args(
             &mut alias_regions,
             wasm_func_ty,
             &mut builder,
-            &args[2..],
+            wasm_args,
         );
         let args_len = builder.ins().iconst(pointer_type, i64::from(args_len));
 
@@ -1545,6 +1558,21 @@ impl Compiler {
             try_call_block,
         );
 
+        // psizam's stack budget enters wasm here: the callee gets what the
+        // store holds. Wasm-to-host trampolines overwrite the store's value
+        // while this call runs, so it is put back when the call is over,
+        // however it ends.
+        let stack_budget = if self.tunables.psizam_stack_meter {
+            let budget = alias_regions
+                .vm_store_context()
+                .psizam_stack_remaining()
+                .load(&mut builder.cursor(), vm_store_ctx);
+            args.push(budget);
+            Some(budget)
+        } else {
+            None
+        };
+
         // Create the invocation of wasm, which is notably done with a
         // `try_call` with an exception handler that's used to handle traps.
         let normal_return = builder.create_block();
@@ -1601,6 +1629,12 @@ impl Compiler {
         // On the normal return path store all the results in the array we were
         // provided and return "true" for "returned successfully".
         builder.switch_to_block(normal_return);
+        if let Some(budget) = stack_budget {
+            alias_regions
+                .vm_store_context()
+                .psizam_stack_remaining()
+                .store(&mut builder.cursor(), vm_store_ctx, budget);
+        }
         self.store_values_to_array(
             &mut alias_regions,
             &mut builder,
@@ -1616,6 +1650,12 @@ impl Compiler {
         // succeed". Note that register restoration is part of the `try_call`
         // and handler implementation.
         builder.switch_to_block(exceptional_return);
+        if let Some(budget) = stack_budget {
+            alias_regions
+                .vm_store_context()
+                .psizam_stack_remaining()
+                .store(&mut builder.cursor(), vm_store_ctx, budget);
+        }
         if cfg!(feature = "component-model") && self.tunables().concurrency_support {
             // NB: A trap unwinds over any fused adapter frames without running
             // their `exit-sync-call`s. That can leave

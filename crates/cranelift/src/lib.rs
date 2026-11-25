@@ -232,9 +232,18 @@ fn wasm_call_signature(
     let mut sig = blank_sig(isa, call_conv);
     let cvt = |ty: &WasmValType| ir::AbiParam::new(value_type(isa, *ty));
     sig.params.extend(wasm_func_ty.params().iter().map(&cvt));
+    if tunables.psizam_stack_meter {
+        // The bytes of psizam's stack budget that remain for the callee. Last,
+        // so that the positions of the wasm parameters do not move.
+        sig.params.push(ir::AbiParam::new(PSIZAM_STACK_BUDGET_TYPE));
+    }
     sig.returns.extend(wasm_func_ty.results().iter().map(&cvt));
     sig
 }
+
+/// The type of the trailing stack-budget argument of the wasm calling
+/// convention under `Tunables::psizam_stack_meter`.
+const PSIZAM_STACK_BUDGET_TYPE: ir::Type = ir::types::I64;
 
 /// Returns the reference type to use for the provided wasm type.
 fn reference_type(wasm_ht: WasmHeapType, pointer_type: ir::Type) -> ir::Type {

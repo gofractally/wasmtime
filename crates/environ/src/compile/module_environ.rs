@@ -255,6 +255,11 @@ pub struct ModuleTranslation<'data> {
     /// [`Tunables::branch_hinting`] is enabled.
     branch_hints: HashMap<FuncIndex, BranchHintReader<'data>>,
 
+    /// psizam's stack byte cost of each defined function, from the
+    /// `psizam.stack-costs` custom section. Present exactly when
+    /// [`Tunables::psizam_stack_meter`] is set.
+    pub psizam_stack_costs: Option<PrimaryMap<DefinedFuncIndex, u32>>,
+
     /// The WebAssembly `start` function, if defined.
     pub start_func: Option<FuncIndex>,
 
@@ -343,6 +348,7 @@ impl<'data> ModuleTranslation<'data> {
             runtime_data_map: Default::default(),
             passive_elem_map: Default::default(),
             branch_hints: HashMap::default(),
+            psizam_stack_costs: None,
             start_func: None,
             global_initializers: Vec::new(),
             passive_elements: Default::default(),
@@ -461,6 +467,14 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
         }
         for memory in self.result.module.memories.values_mut() {
             memory.psizam_execution_profile = profile;
+        }
+        if self.tunables.psizam_stack_meter {
+            if self.tunables.winch_callable {
+                bail!("psizam stack metering is not supported by the Winch calling convention");
+            }
+            let defined = self.result.module.num_defined_funcs();
+            self.result.psizam_stack_costs =
+                Some(crate::psizam_stack_costs(data, defined)?);
         }
         Ok(self.result)
     }

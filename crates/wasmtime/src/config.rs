@@ -2367,6 +2367,18 @@ impl Config {
         self
     }
 
+    /// Enforce psizam's deterministic stack budget in compiled code.
+    ///
+    /// Every module compiled by this engine must then carry a
+    /// `psizam.stack-costs` custom section giving the byte cost of each
+    /// function it defines. A function traps with a stack overflow when the
+    /// store's remaining budget is smaller than its cost; the budget is set
+    /// with `Store::psizam_set_stack_remaining`. Requires Cranelift.
+    pub fn psizam_stack_meter(&mut self, enable: bool) -> &mut Self {
+        self.tunables.psizam_stack_meter = Some(enable);
+        self
+    }
+
     /// A configuration option to force the usage of `memfd_create` on Linux to
     /// be used as the backing source for a module's initial memory image.
     ///
