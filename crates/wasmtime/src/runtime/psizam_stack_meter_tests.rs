@@ -197,3 +197,47 @@ fn psizam_stack_meter_requires_one_cost_per_function() -> Result<()> {
     assert!(unsafe { Module::deserialize(&plain, &metered.serialize()?) }.is_err());
     Ok(())
 }
+
+#[test]
+fn psizam_stack_meter_leaves_the_start_function_to_the_embedder() -> Result<()> {
+    let engine = engine()?;
+    // The start function (cost 50) is not exported and sets a global.
+    let text = r#"(module
+        (global $started (mut i32) (i32.const 0))
+        (func $init (global.set $started (i32.const 1)))
+        (func (export "started") (result i32) (global.get $started))
+        (start $init)
+    )"#;
+    let module = Module::new(&engine, module_bytes(text, &[50, 0]))?;
+    let mut store = Store::new(&engine, ());
+    // Instantiation succeeds with no budget set, because nothing of the
+    // module's own code runs.
+    let instance = Instance::new(&mut store, &module, &[])?;
+    let started = instance.get_typed_func::<(), i32>(&mut store, "started")?;
+    assert_eq!(started.call(&mut store, ())?, 0);
+
+    let start = instance
+        .psizam_deferred_start(&mut store)
+        .unwrap()
+        .typed::<(), ()>(&store)?;
+    store.psizam_set_stack_remaining(49);
+    assert!(overflowed(start.call(&mut store, ())));
+    assert_eq!(started.call(&mut store, ())?, 0);
+    store.psizam_set_stack_remaining(50);
+    start.call(&mut store, ())?;
+    assert_eq!(started.call(&mut store, ())?, 1);
+
+    // A module without a start function has none to defer, and an engine
+    // that does not meter runs it at instantiation as usual.
+    let none = Module::new(&engine, module_bytes(RECURSE, &RECURSE_COSTS))?;
+    let instance = Instance::new(&mut store, &none, &[])?;
+    assert!(instance.psizam_deferred_start(&mut store).is_none());
+    let plain = Engine::default();
+    let module = Module::new(&plain, text)?;
+    let mut store = Store::new(&plain, ());
+    let instance = Instance::new(&mut store, &module, &[])?;
+    assert!(instance.psizam_deferred_start(&mut store).is_none());
+    let started = instance.get_typed_func::<(), i32>(&mut store, "started")?;
+    assert_eq!(started.call(&mut store, ())?, 1);
+    Ok(())
+}

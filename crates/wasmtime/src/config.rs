@@ -2374,6 +2374,10 @@ impl Config {
     /// function it defines. A function traps with a stack overflow when the
     /// store's remaining budget is smaller than its cost; the budget is set
     /// with `Store::psizam_set_stack_remaining`. Requires Cranelift.
+    ///
+    /// A module's start function is then not run at instantiation, since no
+    /// budget can have been set for it yet: the embedder calls
+    /// `Instance::psizam_deferred_start` afterwards.
     pub fn psizam_stack_meter(&mut self, enable: bool) -> &mut Self {
         self.tunables.psizam_stack_meter = Some(enable);
         self

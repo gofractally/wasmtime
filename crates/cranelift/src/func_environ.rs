@@ -6243,7 +6243,11 @@ impl FuncEnvironment<'_> {
             }
         }
         if let Some(i) = self.translation.start_func {
-            self.module_start(builder, i)?;
+            // Under psizam's stack metering the embedder runs the start
+            // function itself, after it has set a stack budget.
+            if !self.tunables.psizam_stack_meter {
+                self.module_start(builder, i)?;
+            }
         }
         Ok(())
     }

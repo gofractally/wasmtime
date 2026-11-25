@@ -192,6 +192,11 @@ pub struct Module {
     /// Whether or not this module has a start function,
     pub startup: ModuleStartup,
 
+    /// The module's start function, when running it is left to the embedder
+    /// (`Tunables::psizam_stack_meter`): it needs a stack budget, and none
+    /// has been set when the module is instantiated.
+    pub psizam_deferred_start: Option<FuncIndex>,
+
     /// Precompute per-table static images, if applicable.
     ///
     /// This map tracks, for each defined table in this module, the initial
@@ -334,6 +339,7 @@ impl Module {
             initializers: Default::default(),
             exports: Default::default(),
             startup: ModuleStartup::None,
+            psizam_deferred_start: None,
             table_initialization: Default::default(),
             memory_initialization: Default::default(),
             passive_elements: Default::default(),
@@ -681,6 +687,7 @@ impl TypeTrace for Module {
             initializers: _,
             exports: _,
             startup,
+            psizam_deferred_start: _,
             table_initialization: _,
             memory_initialization: _,
             passive_elements: _,
@@ -733,6 +740,7 @@ impl TypeTrace for Module {
             initializers: _,
             exports: _,
             startup,
+            psizam_deferred_start: _,
             table_initialization: _,
             memory_initialization: _,
             passive_elements: _,

@@ -504,6 +504,19 @@ impl Instance {
         instance.get_exported_memory(store.0.id(), index).unshared()
     }
 
+    /// The module's start function, which an engine with
+    /// [`Config::psizam_stack_meter`](crate::Config::psizam_stack_meter) does
+    /// not run at instantiation. The embedder calls it, once, after setting
+    /// a stack budget. `None` if the module has no start function.
+    pub fn psizam_deferred_start(&self, mut store: impl AsContextMut) -> Option<Func> {
+        let store = store.as_context_mut();
+        let index = store.0[self.id].env_module().psizam_deferred_start?;
+        let store_id = store.0.id();
+        let (instance, registry) = self.id.get_mut_and_module_registry(store.0);
+        // SAFETY: `store_id` is the store that owns this instance.
+        Some(unsafe { instance.get_exported_func(registry, store_id, index) })
+    }
+
     /// Return memory0 and whether it has memory16-v1 backing.
     ///
     /// A host callback needs its caller's memory whether or not the module

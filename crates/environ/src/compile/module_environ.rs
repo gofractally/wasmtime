@@ -753,6 +753,11 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
                 let func_index = FuncIndex::from_u32(func);
                 debug_assert!(self.result.start_func.is_none());
                 self.result.start_func = Some(func_index);
+                if self.tunables.psizam_stack_meter {
+                    // The embedder calls it once a stack budget is set.
+                    self.flag_func_escaped(func_index);
+                    self.result.module.psizam_deferred_start = Some(func_index);
+                }
 
                 // To make startup a bit easier, invoking the `start` function
                 // is a responsibility deferred to the startup function.
