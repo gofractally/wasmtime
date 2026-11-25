@@ -4700,8 +4700,9 @@ fn bitcast_wasm_params(
     builder: &mut FunctionBuilder,
 ) {
     let callee_signature = &builder.func.dfg.signatures[callee_signature];
+    let params = callee_signature.params.len();
     let changes = bitcast_arguments(builder, arguments, &callee_signature.params, |i| {
-        environ.is_wasm_parameter(i)
+        environ.is_wasm_parameter_of(params, i)
     });
     for (t, arg) in changes {
         let mut flags = MemFlagsData::new();

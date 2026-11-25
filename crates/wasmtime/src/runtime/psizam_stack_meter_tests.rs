@@ -42,8 +42,15 @@ const RECURSE: &str = r#"(module
         (if (local.get 0) (then (call $down (i32.sub (local.get 0) (i32.const 1))))))
     (func $leaf (export "leaf") (result i32) (i32.const 7))
     (func (export "indirect") (result i32) (call_indirect (type $leaf) (i32.const 0)))
+    ;; Callees whose parameter lists differ from the caller's, one of them
+    ;; with a vector parameter.
+    (func $wide (param i64 f64 v128 i32) (result i32) (local.get 3))
+    (func (export "mixed") (param i32) (result i32)
+        (i32.add
+            (call $leaf)
+            (call $wide (i64.const 1) (f64.const 2) (v128.const i32x4 1 2 3 4) (local.get 0))))
 )"#;
-const RECURSE_COSTS: [u32; 3] = [100, 40, 10];
+const RECURSE_COSTS: [u32; 5] = [100, 40, 10, 60, 20];
 
 #[test]
 fn psizam_stack_meter_fails_the_same_call_for_a_given_budget() -> Result<()> {
@@ -78,6 +85,14 @@ fn psizam_stack_meter_fails_the_same_call_for_a_given_budget() -> Result<()> {
     assert!(overflowed(indirect.call(&mut store, ()).map(|_| ())));
     store.psizam_set_stack_remaining(50);
     assert_eq!(indirect.call(&mut store, ())?, 7);
+
+    // Calls to functions of other shapes carry the budget too: `mixed`
+    // (20) calls `leaf` (40) and then `wide` (60), so it needs 80.
+    let mixed = instance.get_typed_func::<i32, i32>(&mut store, "mixed")?;
+    store.psizam_set_stack_remaining(79);
+    assert!(overflowed(mixed.call(&mut store, 5).map(|_| ())));
+    store.psizam_set_stack_remaining(80);
+    assert_eq!(mixed.call(&mut store, 5)?, 12);
 
     // Nothing remains by default: a store that was never given a budget
     // cannot run a function that costs anything.
@@ -160,10 +175,10 @@ fn psizam_stack_meter_requires_one_cost_per_function() -> Result<()> {
     // No section at all, too few costs, and too many.
     assert!(Module::new(&engine, wat::parse_str(RECURSE)?).is_err());
     assert!(Module::new(&engine, module_bytes(RECURSE, &RECURSE_COSTS[..2])).is_err());
-    assert!(Module::new(&engine, module_bytes(RECURSE, &[1, 2, 3, 4])).is_err());
+    assert!(Module::new(&engine, module_bytes(RECURSE, &[1, 2, 3, 4, 5, 6])).is_err());
     // The last section is the one in force: appending the real costs to a
     // module that already carries a section of that name overrides it.
-    let mut twice = module_bytes(RECURSE, &[0, 0, 0]);
+    let mut twice = module_bytes(RECURSE, &[0, 0, 0, 0, 0]);
     let real = module_bytes("(module)", &RECURSE_COSTS);
     twice.extend_from_slice(&real[8..]);
     let module = Module::new(&engine, &twice)?;

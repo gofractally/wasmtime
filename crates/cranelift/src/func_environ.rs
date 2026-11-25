@@ -2709,10 +2709,19 @@ impl FuncEnvironment<'_> {
         &self.heaps
     }
 
+    /// Whether parameter `index` of the function being compiled is one of
+    /// its wasm parameters.
     pub fn is_wasm_parameter(&self, index: usize) -> bool {
         // The first two parameters are the vmctx and caller vmctx. The rest are
         // the wasm parameters, then psizam's stack budget if it is metered.
         index >= 2 && index - 2 < self.wasm_func_ty.params().len()
+    }
+
+    /// The same question about any wasm-convention signature, given how many
+    /// parameters it has.
+    pub fn is_wasm_parameter_of(&self, signature_params: usize, index: usize) -> bool {
+        let trailing = usize::from(self.tunables.psizam_stack_meter);
+        index >= 2 && index + trailing < signature_params
     }
 
     pub fn clif_param_as_wasm_param(&self, index: usize) -> Option<WasmValType> {
