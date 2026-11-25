@@ -161,6 +161,17 @@ fn psizam_stack_meter_requires_one_cost_per_function() -> Result<()> {
     assert!(Module::new(&engine, wat::parse_str(RECURSE)?).is_err());
     assert!(Module::new(&engine, module_bytes(RECURSE, &RECURSE_COSTS[..2])).is_err());
     assert!(Module::new(&engine, module_bytes(RECURSE, &[1, 2, 3, 4])).is_err());
+    // The last section is the one in force: appending the real costs to a
+    // module that already carries a section of that name overrides it.
+    let mut twice = module_bytes(RECURSE, &[0, 0, 0]);
+    let real = module_bytes("(module)", &RECURSE_COSTS);
+    twice.extend_from_slice(&real[8..]);
+    let module = Module::new(&engine, &twice)?;
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[])?;
+    let leaf = instance.get_typed_func::<(), i32>(&mut store, "leaf")?;
+    store.psizam_set_stack_remaining(39);
+    assert!(overflowed(leaf.call(&mut store, ()).map(|_| ())));
     // An engine that does not meter ignores the section, and its compiled
     // code cannot be loaded by one that does.
     let plain = Engine::default();

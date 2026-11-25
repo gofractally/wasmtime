@@ -213,8 +213,9 @@ pub const PSIZAM_STACK_COSTS_SECTION: &str = "psizam.stack-costs";
 
 /// Reads the stack cost of each of a module's `defined` functions.
 ///
-/// The section must be present exactly once and hold exactly one cost per
-/// defined function: a module compiled for metering never runs unmetered.
+/// The section must be present, and the last one of that name must hold
+/// exactly one cost per defined function: a module compiled for metering
+/// never runs unmetered.
 pub fn psizam_stack_costs(data: &[u8], defined: usize) -> Result<PrimaryMap<DefinedFuncIndex, u32>> {
     let mut costs = None;
     for payload in Parser::new(0).parse_all(data) {
@@ -222,9 +223,9 @@ pub fn psizam_stack_costs(data: &[u8], defined: usize) -> Result<PrimaryMap<Defi
             if section.name() != PSIZAM_STACK_COSTS_SECTION {
                 continue;
             }
-            if costs.is_some() {
-                bail!("duplicate psizam.stack-costs section");
-            }
+            // The last section is the one in force. The embedder appends
+            // its own, so a section the module's author put in the module
+            // has no effect and cannot make the module inadmissible.
             let bytes = section.data();
             if bytes.len() % 4 != 0 || bytes.len() / 4 != defined {
                 bail!("psizam.stack-costs does not have one cost per defined function");
