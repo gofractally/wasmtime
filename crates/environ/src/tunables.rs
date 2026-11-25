@@ -66,6 +66,10 @@ define_tunables! {
         /// Enforce psizam's deterministic stack budget in every function's
         /// prologue. See `crates/environ/src/psizam.rs`.
         pub psizam_stack_meter: bool,
+        /// Compute relaxed multiply-add as a multiply followed by an add, each
+        /// rounded, which is the WebAssembly deterministic profile's
+        /// definition. Without it the result is a fused multiply-add.
+        pub psizam_unfused_madd: bool,
         /// The garbage collector implementation to use, which implies the layout of
         /// GC objects and barriers that must be emitted in Wasm code.
         pub collector: Option<Collector>,
@@ -264,6 +268,7 @@ impl Tunables {
         Tunables {
             psizam_memory16: false,
             psizam_stack_meter: false,
+            psizam_unfused_madd: false,
             collector: None,
 
             // No virtual memory tricks are available on miri so make these

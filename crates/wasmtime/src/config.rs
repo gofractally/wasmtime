@@ -2367,6 +2367,16 @@ impl Config {
         self
     }
 
+    /// Compute the relaxed-SIMD multiply-add instructions unfused.
+    ///
+    /// `relaxed_madd(a, b, c)` is then `a * b + c` and `relaxed_nmadd` is
+    /// `-a * b + c`, each operation rounded separately: the WebAssembly
+    /// deterministic profile. By default they are fused multiply-adds.
+    pub fn psizam_unfused_madd(&mut self, enable: bool) -> &mut Self {
+        self.tunables.psizam_unfused_madd = Some(enable);
+        self
+    }
+
     /// Enforce psizam's deterministic stack budget in compiled code.
     ///
     /// Every module compiled by this engine must then carry a

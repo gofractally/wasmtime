@@ -2551,6 +2551,23 @@ pub fn translate_operator(
             environ.stacks.push1(result);
         }
 
+        // psizam's strict float profile computes these unfused: a multiply
+        // and an add, each rounded.
+        Operator::F32x4RelaxedMadd | Operator::F64x2RelaxedMadd
+            if environ.tunables().psizam_unfused_madd =>
+        {
+            let (a, b, c) = pop3_with_bitcast(environ, type_of(op), builder);
+            let product = builder.ins().fmul(a, b);
+            environ.stacks.push1(builder.ins().fadd(product, c));
+        }
+        Operator::F32x4RelaxedNmadd | Operator::F64x2RelaxedNmadd
+            if environ.tunables().psizam_unfused_madd =>
+        {
+            let (a, b, c) = pop3_with_bitcast(environ, type_of(op), builder);
+            let a = builder.ins().fneg(a);
+            let product = builder.ins().fmul(a, b);
+            environ.stacks.push1(builder.ins().fadd(product, c));
+        }
         Operator::F32x4RelaxedMadd => {
             let (a, b, c) = pop3_with_bitcast(environ, type_of(op), builder);
             let result = environ.fma_f32x4(builder, a, b, c);

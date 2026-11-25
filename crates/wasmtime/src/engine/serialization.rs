@@ -299,6 +299,7 @@ impl Metadata<'_> {
             // enforces the asymmetric override rule after metadata is read.
             psizam_memory16: _,
             psizam_stack_meter,
+            psizam_unfused_madd,
             collector,
             memory_reservation,
             memory_guard_size,
@@ -378,6 +379,11 @@ impl Metadata<'_> {
             psizam_stack_meter,
             other.psizam_stack_meter,
             "psizam stack metering",
+        )?;
+        Self::check_bool(
+            psizam_unfused_madd,
+            other.psizam_unfused_madd,
+            "psizam unfused multiply-add",
         )?;
         Self::check_bool(debug_symbols, other.debug_symbols, "debug symbols")?;
         Self::check_bool(

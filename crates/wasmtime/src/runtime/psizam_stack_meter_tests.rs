@@ -251,3 +251,34 @@ fn psizam_stack_meter_leaves_the_start_function_to_the_embedder() -> Result<()> 
     assert_eq!(started.call(&mut store, ())?, 1);
     Ok(())
 }
+
+#[test]
+fn psizam_unfused_madd_rounds_the_product_before_adding() -> Result<()> {
+    // With a = b = 1 + 2^-27 the exact product is 1 + 2^-26 + 2^-54, which
+    // rounds to 1 + 2^-26. Adding c = -(1 + 2^-26) therefore gives 0 when the
+    // product is rounded first and 2^-54 when the operation is fused.
+    let text = r#"(module
+        (func (export "madd") (param f64 f64 f64) (result f64)
+            (f64x2.extract_lane 0 (f64x2.relaxed_madd
+                (f64x2.splat (local.get 0)) (f64x2.splat (local.get 1)) (f64x2.splat (local.get 2)))))
+        (func (export "nmadd") (param f64 f64 f64) (result f64)
+            (f64x2.extract_lane 0 (f64x2.relaxed_nmadd
+                (f64x2.splat (local.get 0)) (f64x2.splat (local.get 1)) (f64x2.splat (local.get 2)))))
+    )"#;
+    let a = 1.0 + 2f64.powi(-27);
+    let c = 1.0 + 2f64.powi(-26);
+    for (unfused, expected) in [(true, 0.0), (false, 2f64.powi(-54))] {
+        let mut config = Config::new();
+        config.psizam_unfused_madd(unfused);
+        let engine = Engine::new(&config)?;
+        let module = Module::new(&engine, text)?;
+        let mut store = Store::new(&engine, ());
+        let instance = Instance::new(&mut store, &module, &[])?;
+        let madd = instance.get_typed_func::<(f64, f64, f64), f64>(&mut store, "madd")?;
+        let nmadd = instance.get_typed_func::<(f64, f64, f64), f64>(&mut store, "nmadd")?;
+        assert_eq!(madd.call(&mut store, (a, a, -c))?, expected);
+        // -a * a + c is the same difference with the sign reversed.
+        assert_eq!(nmadd.call(&mut store, (a, a, c))?, -expected);
+    }
+    Ok(())
+}
