@@ -208,7 +208,17 @@ fn psizam_stack_meter_leaves_the_start_function_to_the_embedder() -> Result<()> 
         (func (export "started") (result i32) (global.get $started))
         (start $init)
     )"#;
-    let module = Module::new(&engine, module_bytes(text, &[50, 0]))?;
+    // Without the request the start function runs at instantiation, where
+    // nothing remains for it.
+    let eager = Module::new(&engine, module_bytes(text, &[50, 0]))?;
+    let mut store = Store::new(&engine, ());
+    assert!(overflowed(Instance::new(&mut store, &eager, &[]).map(|_| ())));
+
+    let mut deferring = module_bytes(text, &[50, 0]);
+    let name = wasmtime_environ::PSIZAM_DEFER_START_SECTION.as_bytes();
+    deferring.extend_from_slice(&[0, 1 + name.len() as u8, name.len() as u8]);
+    deferring.extend_from_slice(name);
+    let module = Module::new(&engine, deferring)?;
     let mut store = Store::new(&engine, ());
     // Instantiation succeeds with no budget set, because nothing of the
     // module's own code runs.

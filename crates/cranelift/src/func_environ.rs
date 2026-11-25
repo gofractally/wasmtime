@@ -6243,9 +6243,9 @@ impl FuncEnvironment<'_> {
             }
         }
         if let Some(i) = self.translation.start_func {
-            // Under psizam's stack metering the embedder runs the start
-            // function itself, after it has set a stack budget.
-            if !self.tunables.psizam_stack_meter {
+            // A module that defers its start function leaves running it to
+            // the embedder, which first sets a stack budget.
+            if self.module.psizam_deferred_start.is_none() {
                 self.module_start(builder, i)?;
             }
         }

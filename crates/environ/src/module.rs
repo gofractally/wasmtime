@@ -193,8 +193,8 @@ pub struct Module {
     pub startup: ModuleStartup,
 
     /// The module's start function, when running it is left to the embedder
-    /// (`Tunables::psizam_stack_meter`): it needs a stack budget, and none
-    /// has been set when the module is instantiated.
+    /// (`psizam_defers_start`): it needs a stack budget, and none has been
+    /// set when the module is instantiated.
     pub psizam_deferred_start: Option<FuncIndex>,
 
     /// Precompute per-table static images, if applicable.

@@ -242,3 +242,24 @@ pub fn psizam_stack_costs(data: &[u8], defined: usize) -> Result<PrimaryMap<Defi
         None => bail!("stack metering requires a psizam.stack-costs section"),
     }
 }
+
+/// The name of the empty custom section by which the embedder asks that a
+/// module's start function not be run at instantiation.
+pub const PSIZAM_DEFER_START_SECTION: &str = "psizam.defer-start";
+
+/// Whether `data` asks for its start function to be left to the embedder.
+///
+/// A metered start function needs a stack budget, and none can have been set
+/// when the module is instantiated. Like the costs, this is the embedder's
+/// statement about how it will run the module, appended to it; it only has
+/// an effect under `Tunables::psizam_stack_meter`.
+pub fn psizam_defers_start(data: &[u8]) -> Result<bool> {
+    for payload in Parser::new(0).parse_all(data) {
+        if let Payload::CustomSection(section) = payload? {
+            if section.name() == PSIZAM_DEFER_START_SECTION {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}

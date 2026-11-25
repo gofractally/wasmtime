@@ -67,7 +67,8 @@ pub use crate::module::*;
 pub use crate::module_artifacts::*;
 pub use crate::module_types::*;
 pub use crate::psizam::{
-    PSIZAM_STACK_COSTS_SECTION, psizam_execution_profile, psizam_stack_costs,
+    PSIZAM_DEFER_START_SECTION, PSIZAM_STACK_COSTS_SECTION, psizam_defers_start,
+    psizam_execution_profile, psizam_stack_costs,
 };
 pub use crate::ref_bits::*;
 pub use crate::scopevec::ScopeVec;

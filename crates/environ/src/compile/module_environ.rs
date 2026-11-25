@@ -36,6 +36,10 @@ pub struct ModuleEnvironment<'a, 'data> {
     // Various bits and pieces of configuration
     validator: &'a mut Validator,
     tunables: &'a Tunables,
+
+    /// Whether this module's start function is left to the embedder. See
+    /// `crate::psizam_defers_start`.
+    psizam_defer_start: bool,
 }
 
 /// Identifies a FACT adapter-module import that the compiler lowers inline when
@@ -439,6 +443,7 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
             result: ModuleTranslation::new(module_index),
             types,
             tunables,
+            psizam_defer_start: false,
             validator,
         }
     }
@@ -457,6 +462,8 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
         data: &'data [u8],
     ) -> Result<ModuleTranslation<'data>> {
         self.result.wasm = data;
+        self.psizam_defer_start =
+            self.tunables.psizam_stack_meter && crate::psizam_defers_start(data)?;
         let profile = crate::psizam_execution_profile(data, self.tunables.psizam_memory16)?;
         if profile != 0 && self.tunables.winch_callable {
             bail!("memory16 is not supported by the Winch calling convention");
@@ -753,7 +760,7 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
                 let func_index = FuncIndex::from_u32(func);
                 debug_assert!(self.result.start_func.is_none());
                 self.result.start_func = Some(func_index);
-                if self.tunables.psizam_stack_meter {
+                if self.psizam_defer_start {
                     // The embedder calls it once a stack budget is set.
                     self.flag_func_escaped(func_index);
                     self.result.module.psizam_deferred_start = Some(func_index);
