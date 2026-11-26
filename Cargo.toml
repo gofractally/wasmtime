@@ -361,7 +361,13 @@ pulley-interpreter-fuzz = { path = 'pulley/fuzz' }
 
 # Bytecode Alliance maintained dependencies:
 # ---------------------------
-regalloc2 = "0.15.2"
+# regalloc2 0.15.3 plus, from gofractally/regalloc2 (branch `scan-fix`):
+# upstream's #281 and the fix for the rest of the quadratic `blockparam_ins`
+# walk in move insertion, and cooperative cancellation
+# (`run_with_ctx_cancellable`, which cranelift-codegen calls). A git
+# dependency rather than a `[patch]`, so that crates depending on this
+# workspace get it too. Go back to crates.io once a release has both.
+regalloc2 = { git = "https://github.com/gofractally/regalloc2", rev = "bfce51e3d3293eca7626b210e141c7e80d8c07ca", version = "0.15.3" }
 wasip1 = { version = "1.0.0", default-features = false }
 
 # cap-std family:
