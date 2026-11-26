@@ -1,6 +1,7 @@
 //! Compilation backend pipeline: optimized IR to VCode / binemit.
 
 use crate::Cancel;
+use crate::CodegenError;
 use crate::dominator_tree::DominatorTree;
 use crate::ir::Function;
 use crate::isa::TargetIsa;
@@ -68,8 +69,19 @@ pub fn compile<B: LowerBackend + TargetIsa>(
             RegallocAlgorithm::SinglePass => Algorithm::Fastalloc,
         };
 
-        regalloc2::run_with_ctx(&vcode, vcode.abi.machine_env(), &options, regalloc_ctx)
-            .map_err(|err| {
+        // The allocator looks at the flag inside its long loops. A
+        // cancellation is the one allocation error that is not a bug: it is
+        // passed on, where any other still panics.
+        match regalloc2::run_with_ctx_cancellable(
+            &vcode,
+            vcode.abi.machine_env(),
+            &options,
+            regalloc_ctx,
+            cancel.flag(),
+        ) {
+            Ok(_) => {}
+            Err(regalloc2::RegAllocError::Cancelled) => return Err(CodegenError::Cancelled),
+            Err(err) => {
                 log::error!(
                     "Register allocation error for vcode\n\
                      {vcode:?}\n\
@@ -77,11 +89,10 @@ pub fn compile<B: LowerBackend + TargetIsa>(
                      CLIF for error:\n\
                      {f:?}",
                 );
-                err
-            })
-            .expect("register allocation");
+                panic!("register allocation: {err:?}");
+            }
+        }
     }
-    cancel.check()?;
 
     // Run the regalloc checker, if requested.
     if b.flags().regalloc_checker() {

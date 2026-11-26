@@ -51,6 +51,52 @@ fn many_functions(count: usize) -> Vec<u8> {
     module(&vec![body; count])
 }
 
+fn sleb(mut n: i64, out: &mut Vec<u8>) {
+    loop {
+        let byte = (n & 0x7f) as u8;
+        n >>= 7;
+        if (n == 0 && byte & 0x40 == 0) || (n == -1 && byte & 0x40 != 0) {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+/// One function in which `locals` values are written on one path into a
+/// merge point that `targets` further edges (a `br_table`) also reach, and
+/// are read after it. Every local needs a block parameter at the merge, and
+/// every edge carries an argument for each of them: `locals * targets` moves
+/// for the register allocator, which is where nearly all of this function's
+/// compile time goes.
+fn wide_merge(locals: usize, targets: usize) -> Vec<u8> {
+    let mut b = Vec::new();
+    leb(1, &mut b);
+    leb(locals, &mut b);
+    b.push(0x7e); // i64
+    b.extend_from_slice(&[0x02, 0x40, 0x02, 0x40]); // block $merge, block $out
+    b.extend_from_slice(&[0x20, 0x00, 0x04, 0x40]); // local.get 0, if
+    for i in 1..=locals {
+        b.push(0x42); // i64.const
+        sleb(i as i64, &mut b);
+        b.push(0x21); // local.set
+        leb(i, &mut b);
+    }
+    b.extend_from_slice(&[0x0c, 0x02, 0x0b]); // br $merge, end
+    b.extend_from_slice(&[0x20, 0x00, 0x0e]); // local.get 0, br_table
+    leb(targets, &mut b);
+    b.resize(b.len() + targets, 0x01); // each target: $merge
+    b.extend_from_slice(&[0x00, 0x0b, 0x0b]); // default $out, end, end
+    b.extend_from_slice(&[0x20, 0x01]); // local.get 1
+    for i in 2..=locals {
+        b.push(0x20);
+        leb(i, &mut b);
+        b.push(0x7c); // i64.add
+    }
+    b.push(0x0b);
+    module(&[&b])
+}
+
 /// A small module with some arithmetic, a loop and a call.
 const SMALL: &str = r#"(module
     (func $sum (param i32) (result i64)
@@ -272,5 +318,41 @@ fn a_cancelled_compilation_is_not_cached() -> Result<()> {
     );
     Module::new(&engine, &small)?;
     assert_eq!(engine.config().cache.as_ref().unwrap().cache_hits(), 1);
+    Ok(())
+}
+
+/// A function that spends its compile time in one long register allocation
+/// is abandoned inside that allocation, not at the end of it.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_long_register_allocation_is_interrupted() -> Result<()> {
+    let engine = engine(false)?;
+    let wasm = wide_merge(1_000, 1_000);
+
+    // How long it takes when left alone.
+    let start = Instant::now();
+    let reference = engine.precompile_module(&wasm)?;
+    let whole = start.elapsed();
+
+    for fraction in [0.2, 0.35, 0.5] {
+        let (result, latency) = cancel_after(&engine, &wasm, whole.mul_f64(fraction));
+        assert_cancelled(result);
+        // Register allocation is all but the first and last few percent of
+        // this compilation, so each of these cancellations arrives inside
+        // it, with at least 0.4 of the whole time still to go. Without a
+        // check in the allocator the compilation would return only when the
+        // allocation ends. With the checks it is back within milliseconds,
+        // or after the longest sort; the bound allows for that and for a
+        // loaded machine.
+        assert!(
+            latency < whole.mul_f64(0.25),
+            "returned {latency:?} after a cancellation at {fraction} of {whole:?}"
+        );
+    }
+
+    // And the function still compiles to the same code.
+    let cancel = CompileCancel::new();
+    let again = builder(&engine, &wasm, &cancel).compile_module_serialized()?;
+    assert!(reference == again, "the serialized module differs");
     Ok(())
 }
