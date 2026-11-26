@@ -1,5 +1,6 @@
 //! Compilation backend pipeline: optimized IR to VCode / binemit.
 
+use crate::Cancel;
 use crate::dominator_tree::DominatorTree;
 use crate::ir::Function;
 use crate::isa::TargetIsa;
@@ -21,7 +22,10 @@ pub fn compile<B: LowerBackend + TargetIsa>(
     emit_info: <B::MInst as MachInstEmit>::Info,
     sigs: SigSet,
     ctrl_plane: &mut ControlPlane,
+    cancel: Cancel<'_>,
 ) -> CodegenResult<VCode<B::MInst>> {
+    cancel.check()?;
+
     // Compute lowered block order.
     let block_order = BlockLoweringOrder::new(f, domtree, ctrl_plane);
 
@@ -38,7 +42,7 @@ pub fn compile<B: LowerBackend + TargetIsa>(
         log::debug!("Number of CLIF blocks to lower: {}", f.dfg.num_blocks());
 
         let _tt = timing::vcode_lower();
-        lower.lower(b, ctrl_plane)?
+        lower.lower(b, ctrl_plane, cancel)?
     };
 
     log::debug!(
@@ -47,6 +51,7 @@ pub fn compile<B: LowerBackend + TargetIsa>(
     );
     log::debug!("Number of lowered vcode blocks: {}", vcode.num_blocks());
     trace!("vcode from lowering: \n{:?}", vcode);
+    cancel.check()?;
 
     // Perform register allocation.
     {
@@ -76,6 +81,7 @@ pub fn compile<B: LowerBackend + TargetIsa>(
             })
             .expect("register allocation");
     }
+    cancel.check()?;
 
     // Run the regalloc checker, if requested.
     if b.flags().regalloc_checker() {

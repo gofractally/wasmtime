@@ -42,6 +42,59 @@ pub enum CompileError {
 
     /// A compilation error occurred.
     DebugInfoNotSupported,
+
+    /// The compilation was abandoned because its [`CompileCancel`] handle was
+    /// set. This says nothing about the function being compiled.
+    Cancelled,
+}
+
+/// A handle with which an embedder abandons a compilation in progress.
+///
+/// The handle is a shared flag. Whoever compiles hands a clone to the
+/// compilation; setting the flag with [`CompileCancel::cancel`], from any
+/// thread, makes that compilation stop soon afterwards and fail with
+/// [`CompileError::Cancelled`]. The compiler looks at the flag before each
+/// function, between its passes and inside register allocation; each look is
+/// one relaxed atomic load. A compilation whose handle is never set produces
+/// exactly what it would produce without a handle.
+///
+/// A handle that has been set stays set: use a new one for the next
+/// compilation.
+#[derive(Clone, Debug, Default)]
+pub struct CompileCancel(Arc<core::sync::atomic::AtomicBool>);
+
+impl CompileCancel {
+    /// Creates a handle that is not set.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Asks every compilation holding this handle to stop.
+    pub fn cancel(&self) {
+        self.0.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Has [`CompileCancel::cancel`] been called?
+    #[inline]
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Returns `Err(CompileError::Cancelled)` once the handle has been set.
+    #[inline]
+    pub fn check(&self) -> Result<(), CompileError> {
+        if self.is_cancelled() {
+            Err(CompileError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// The flag itself, for a compiler that passes it on by reference.
+    #[inline]
+    pub fn flag(&self) -> &core::sync::atomic::AtomicBool {
+        &self.0
+    }
 }
 
 impl fmt::Display for CompileError {
@@ -52,6 +105,7 @@ impl fmt::Display for CompileError {
             CompileError::DebugInfoNotSupported => {
                 write!(f, "Debug info is not supported with this configuration")
             }
+            CompileError::Cancelled => write!(f, "Compilation was cancelled"),
         }
     }
 }
@@ -247,6 +301,9 @@ pub trait Compiler: Send + Sync {
     /// The body of the function is available in `data` and configuration
     /// values are also passed in via `tunables`. Type information in
     /// `translation` is all relative to `types`.
+    ///
+    /// If `cancel` is given and set, before or during this call, the
+    /// implementation returns `CompileError::Cancelled` as soon as it notices.
     fn compile_function(
         &self,
         translation: &ModuleTranslation<'_>,
@@ -254,6 +311,7 @@ pub trait Compiler: Send + Sync {
         data: FunctionBodyData<'_>,
         types: &ModuleTypesBuilder,
         symbol: &str,
+        cancel: Option<&CompileCancel>,
     ) -> Result<CompiledFunctionBody, CompileError>;
 
     /// Compile a trampoline for an array-call host function caller calling the
@@ -303,11 +361,16 @@ pub trait Compiler: Send + Sync {
     ///
     /// The return value is an index within `funcs` that the relocation points
     /// to.
+    ///
+    /// If `cancel` is given and set, the implementation fails with a
+    /// [`CompileError::Cancelled`] as soon as it notices; a module can have
+    /// very many functions.
     fn append_code(
         &self,
         obj: &mut Object<'static>,
         funcs: &[(String, FuncKey, Box<dyn Any + Send + Sync>)],
         resolve_reloc: &dyn Fn(usize, FuncKey) -> usize,
+        cancel: Option<&CompileCancel>,
     ) -> Result<Vec<(Option<SymbolId>, FunctionLoc)>>;
 
     /// Creates a new `Object` file which is used to build the results of a
@@ -470,10 +533,15 @@ pub trait InliningCompiler: Sync + Send {
     /// This method **must** be called before passing the
     /// `CompiledFunctionBody`'s contents to `Compiler::append_code`, even if no
     /// inlining was performed.
+    ///
+    /// If `cancel` is given and set, before or during this call, the
+    /// implementation fails with a [`CompileError::Cancelled`] as soon as it
+    /// notices, and `func` must not be used afterwards.
     fn finish_compiling(
         &self,
         func: &mut CompiledFunctionBody,
         input: Option<wasmparser::FunctionBody<'_>>,
         symbol: &str,
+        cancel: Option<&CompileCancel>,
     ) -> Result<()>;
 }

@@ -19,8 +19,8 @@ use cranelift_codegen::isa::{
 };
 use cranelift_codegen::print_errors::pretty_error;
 use cranelift_codegen::{
-    CompiledCode, Context, MachBufferDebugTagList, MachBufferFrameLayout, MachCallSiteItem,
-    MachDebugTagPos,
+    Cancel, CodegenError, CompiledCode, Context, MachBufferDebugTagList, MachBufferFrameLayout,
+    MachCallSiteItem, MachDebugTagPos,
 };
 use cranelift_entity::PrimaryMap;
 use cranelift_frontend::FunctionBuilder;
@@ -38,12 +38,12 @@ use wasmparser::{FuncValidatorAllocations, FunctionBody};
 use wasmtime_environ::error::{Context as _, Result};
 use wasmtime_environ::obj::{ELF_WASMTIME_EXCEPTIONS, ELF_WASMTIME_FRAMES};
 use wasmtime_environ::{
-    Abi, AddressMapSection, BuiltinFunctionIndex, CacheStore, CompileError, CompiledFunctionBody,
-    DefinedFuncIndex, FlagValue, FrameInstPos, FrameStackShape, FrameStateSlotBuilder,
-    FrameTableBuilder, FuncKey, FunctionBodyData, FunctionLoc, GetPtrSize, HostCall,
-    InliningCompiler, ModulePC, ModuleStartup, ModuleTranslation, ModuleTypesBuilder, PtrSize,
-    StackMapSection, StaticModuleIndex, TrapEncodingBuilder, TrapSentinel, TripleExt, Tunables,
-    WasmFuncType, WasmValType, prelude::*,
+    Abi, AddressMapSection, BuiltinFunctionIndex, CacheStore, CompileCancel, CompileError,
+    CompiledFunctionBody, DefinedFuncIndex, FlagValue, FrameInstPos, FrameStackShape,
+    FrameStateSlotBuilder, FrameTableBuilder, FuncKey, FunctionBodyData, FunctionLoc, GetPtrSize,
+    HostCall, InliningCompiler, ModulePC, ModuleStartup, ModuleTranslation, ModuleTypesBuilder,
+    PtrSize, StackMapSection, StaticModuleIndex, TrapEncodingBuilder, TrapSentinel, TripleExt,
+    Tunables, WasmFuncType, WasmValType, prelude::*,
 };
 use wasmtime_unwinder::ExceptionTableBuilder;
 
@@ -505,8 +505,12 @@ impl wasmtime_environ::Compiler for Compiler {
         input: FunctionBodyData<'_>,
         types: &ModuleTypesBuilder,
         symbol: &str,
+        cancel: Option<&CompileCancel>,
     ) -> Result<CompiledFunctionBody, CompileError> {
         log::trace!("compiling Wasm function: {key:?} = {symbol:?}");
+        if let Some(cancel) = cancel {
+            cancel.check()?;
+        }
 
         let isa = &*self.isa;
         let module = &translation.module;
@@ -707,6 +711,7 @@ impl wasmtime_environ::Compiler for Compiler {
         obj: &mut Object<'static>,
         funcs: &[(String, FuncKey, Box<dyn Any + Send + Sync>)],
         resolve_reloc: &dyn Fn(usize, FuncKey) -> usize,
+        cancel: Option<&CompileCancel>,
     ) -> Result<Vec<(Option<SymbolId>, FunctionLoc)>> {
         log::trace!(
             "appending functions to object file: {:#?}",
@@ -752,6 +757,11 @@ impl wasmtime_environ::Compiler for Compiler {
 
         let mut ret = Vec::with_capacity(funcs.len());
         for (i, (sym, _key, func)) in funcs.iter().enumerate() {
+            if let Some(cancel) = cancel
+                && i % 1024 == 0
+            {
+                cancel.check()?;
+            }
             let (sym_id, range) = builder.append_func(&sym, func, |idx| resolve_reloc(i, idx));
             log::trace!("symbol id {sym_id:?} = {sym:?}");
 
@@ -1092,8 +1102,18 @@ impl InliningCompiler for Compiler {
         func_body: &mut CompiledFunctionBody,
         input: Option<wasmparser::FunctionBody<'_>>,
         symbol: &str,
+        cancel: Option<&CompileCancel>,
     ) -> Result<()> {
         log::trace!("finish compiling {symbol:?}");
+        // The flag travels down by reference from here: Cranelift looks at
+        // it between passes and hands it to the register allocator.
+        let cancel = match cancel {
+            Some(cancel) => {
+                cancel.check()?;
+                Cancel::new(cancel.flag())
+            }
+            None => Cancel::never(),
+        };
         debug_assert!(!func_body.code.is::<CompiledFunction>());
         debug_assert!(func_body.code.is::<Option<Box<CompilerContext>>>());
         let cx = func_body
@@ -1111,10 +1131,13 @@ impl InliningCompiler for Compiler {
             Some(Abi::Patchable) => Cow::Owned(format!("{symbol}_patchable_call")),
         };
 
+        // On any error, a cancellation included, `compiler` and with it the
+        // function's `CompilerContext` are dropped here: only a context that
+        // finished its function goes back to the pool.
         let compiled_func = if let Some(input) = input {
-            compiler.finish_with_info(Some((&input, &self.tunables)), &symbol)?
+            compiler.finish_with_info(Some((&input, &self.tunables)), &symbol, cancel)?
         } else {
-            compiler.finish(&symbol)?
+            compiler.finish_with_info(None, &symbol, cancel)?
         };
 
         let timing = cranelift_codegen::timing::take_current();
@@ -1137,20 +1160,30 @@ impl cranelift_codegen::incremental_cache::CacheKvStore for CraneliftCacheStore 
     }
 }
 
+/// A Cranelift error as this crate's: a cancellation keeps its identity,
+/// anything else becomes text.
+fn codegen_error(func: &ir::Function, error: CodegenError) -> CompileError {
+    match error {
+        CodegenError::Cancelled => CompileError::Cancelled,
+        error => CompileError::Codegen(pretty_error(func, error)),
+    }
+}
+
 fn compile_maybe_cached<'a>(
     context: &'a mut Context,
     isa: &dyn TargetIsa,
     cache_ctx: Option<&mut IncrementalCacheContext>,
+    cancel: Cancel<'_>,
 ) -> Result<CompiledCode, CompileError> {
     let cache_ctx = match cache_ctx {
         Some(ctx) => ctx,
-        None => return compile_uncached(context, isa),
+        None => return compile_uncached(context, isa, cancel),
     };
 
     let mut cache_store = CraneliftCacheStore(cache_ctx.cache_store.clone());
     let (_compiled_code, from_cache) = context
-        .compile_with_cache(isa, &mut cache_store, &mut Default::default())
-        .map_err(|error| CompileError::Codegen(pretty_error(&error.func, error.inner)))?;
+        .compile_with_cache_cancellable(isa, &mut cache_store, &mut Default::default(), cancel)
+        .map_err(|error| codegen_error(&error.func, error.inner))?;
 
     if from_cache {
         cache_ctx.num_hits += 1;
@@ -1164,10 +1197,11 @@ fn compile_maybe_cached<'a>(
 fn compile_uncached<'a>(
     context: &'a mut Context,
     isa: &dyn TargetIsa,
+    cancel: Cancel<'_>,
 ) -> Result<CompiledCode, CompileError> {
     context
-        .compile(isa, &mut Default::default())
-        .map_err(|error| CompileError::Codegen(pretty_error(&error.func, error.inner)))?;
+        .compile_cancellable(isa, &mut Default::default(), cancel)
+        .map_err(|error| codegen_error(&error.func, error.inner))?;
     Ok(context.take_compiled_code().unwrap())
 }
 
@@ -1721,14 +1755,11 @@ impl FunctionCompiler<'_> {
         (builder, block0)
     }
 
-    fn finish(self, symbol: &str) -> Result<CompiledFunction, CompileError> {
-        self.finish_with_info(None, symbol)
-    }
-
     fn finish_with_info(
         mut self,
         body_and_tunables: Option<(&FunctionBody<'_>, &Tunables)>,
         symbol: &str,
+        cancel: Cancel<'_>,
     ) -> Result<CompiledFunction, CompileError> {
         let context = &mut self.cx.codegen_context;
         let isa = &*self.compiler.isa;
@@ -1739,7 +1770,7 @@ impl FunctionCompiler<'_> {
         // finishes to optionally emit CLIF and then after that's done actually
         // propagate the error if one happened.
         let compilation_result =
-            compile_maybe_cached(context, isa, self.cx.incremental_cache_ctx.as_mut());
+            compile_maybe_cached(context, isa, self.cx.incremental_cache_ctx.as_mut(), cancel);
 
         if let Some(path) = &self.compiler.clif_dir {
             use std::io::Write;

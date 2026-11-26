@@ -50,6 +50,7 @@ include!(concat!(env!("ISLE_DIR"), "/isle_numerics.rs"));
 mod machinst;
 
 pub mod binemit;
+pub mod cancel;
 pub mod cfg_printer;
 pub mod cursor;
 pub mod data_value;
@@ -101,6 +102,7 @@ mod value_label;
 #[cfg(feature = "souper-harvest")]
 mod souper_harvest;
 
+pub use crate::cancel::Cancel;
 pub use crate::result::{CodegenError, CodegenResult, CompileError};
 pub use crate::take_and_replace::TakeAndReplace;
 

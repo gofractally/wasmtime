@@ -70,6 +70,7 @@ impl Riscv64Backend {
         domtree: &DominatorTree,
         regalloc_ctx: &mut regalloc2::Ctx,
         ctrl_plane: &mut ControlPlane,
+        cancel: crate::Cancel<'_>,
     ) -> CodegenResult<VCode<inst::Inst>> {
         let emit_info = EmitInfo::new(self.flags.clone(), self.isa_flags.clone());
         let sigs = SigSet::new::<abi::Riscv64MachineDeps>(func, &self.flags)?;
@@ -83,6 +84,7 @@ impl Riscv64Backend {
             emit_info,
             sigs,
             ctrl_plane,
+            cancel,
         )
     }
 }
@@ -95,11 +97,18 @@ impl TargetIsa for Riscv64Backend {
         regalloc_ctx: &mut regalloc2::Ctx,
         want_disasm: bool,
         ctrl_plane: &mut ControlPlane,
+        cancel: crate::Cancel<'_>,
     ) -> CodegenResult<CompiledCodeStencil> {
-        let vcode = self.compile_vcode(func, domtree, regalloc_ctx, ctrl_plane)?;
+        let vcode = self.compile_vcode(func, domtree, regalloc_ctx, ctrl_plane, cancel)?;
 
         let want_disasm = want_disasm || log::log_enabled!(log::Level::Debug);
-        let emit_result = vcode.emit(&regalloc_ctx.output, want_disasm, &self.flags, ctrl_plane)?;
+        let emit_result = vcode.emit(
+            &regalloc_ctx.output,
+            want_disasm,
+            &self.flags,
+            ctrl_plane,
+            cancel,
+        )?;
         let value_labels_ranges = emit_result.value_labels_ranges;
         let buffer = emit_result.buffer;
 

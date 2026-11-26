@@ -2,7 +2,7 @@
 use crate::component::Component;
 use crate::prelude::*;
 use crate::runtime::vm::MmapVec;
-use crate::{CodeBuilder, CodeMemory, Engine, Module};
+use crate::{CodeBuilder, CodeMemory, CompileCancel, Engine, Module};
 use object::write::WritableBuffer;
 use std::sync::Arc;
 use wasmtime_environ::{FinishedObject, ObjectBuilder};
@@ -16,12 +16,14 @@ impl<'a> CodeBuilder<'a> {
             Option<&[u8]>,
             Option<&str>,
             &S,
+            Option<&CompileCancel>,
         ) -> Result<(MmapVecWrapper, Option<T>)>,
         state: &S,
     ) -> Result<(Arc<CodeMemory>, Option<T>)> {
         let wasm = self.get_wasm()?;
         let dwarf_package = self.get_dwarf_package();
         let unsafe_intrinsics_import = self.get_unsafe_intrinsics_import();
+        let cancel = self.get_cancel_handle();
 
         self.engine
             .check_compatible_with_native_host()
@@ -40,6 +42,11 @@ impl<'a> CodeBuilder<'a> {
                 // things like required runtime alignment, and does
                 // not impact the compilation result itself.
                 NotHashed(state),
+                // Nor the cancellation handle: it decides whether there is a
+                // result, never what the result is. A cancelled compilation
+                // is an error of the closure below, and an error is not
+                // cached.
+                NotHashed(cancel),
             );
             let (code, info_and_types) =
                 wasmtime_cache::ModuleCacheEntry::new("wasmtime", self.engine.cache())
@@ -53,6 +60,7 @@ impl<'a> CodeBuilder<'a> {
                             unsafe_intrinsics_import,
                             build_artifacts,
                             state,
+                            cancel,
                         )|
                          -> Result<_> {
                             let (mmap, info) = (build_artifacts.0)(
@@ -61,16 +69,17 @@ impl<'a> CodeBuilder<'a> {
                                 dwarf_package.as_deref(),
                                 **unsafe_intrinsics_import,
                                 state.0,
+                                cancel.0,
                             )?;
                             let code = publish_mmap(engine.0, mmap.0)?;
                             Ok((code, info))
                         },
                         // Implementation of how to serialize artifacts
-                        |(_engine, _wasm, _, _, _, _), (code, _info_and_types)| {
+                        |(_engine, _wasm, _, _, _, _, _), (code, _info_and_types)| {
                             Some(code.mmap().to_vec())
                         },
                         // Cache hit, deserialize the provided artifacts
-                        |(engine, wasm, _, _, _, _), serialized_bytes| {
+                        |(engine, wasm, _, _, _, _, _), serialized_bytes| {
                             let kind = if wasmparser::Parser::is_component(&wasm) {
                                 wasmtime_environ::ObjectKind::Component
                             } else {
@@ -97,6 +106,7 @@ impl<'a> CodeBuilder<'a> {
                 dwarf_package.as_deref(),
                 unsafe_intrinsics_import,
                 state,
+                cancel,
             )?;
             let code = publish_mmap(self.engine, mmap.0)?;
             return Ok((code, info_and_types));
@@ -122,9 +132,9 @@ impl<'a> CodeBuilder<'a> {
 
         let custom_alignment = self.custom_alignment();
         let (code, info_and_types) = self.compile_cached(
-            |engine, wasm, dwarf, unsafe_intrinsics_import, state| {
+            |engine, wasm, dwarf, unsafe_intrinsics_import, state, cancel| {
                 assert!(unsafe_intrinsics_import.is_none());
-                super::build_module_artifacts(engine, wasm, dwarf, state)
+                super::build_module_artifacts(engine, wasm, dwarf, state, cancel)
             },
             &custom_alignment,
         )?;
@@ -137,13 +147,14 @@ impl<'a> CodeBuilder<'a> {
     pub fn compile_component(&self) -> Result<Component> {
         let custom_alignment = self.custom_alignment();
         let (code, artifacts) = self.compile_cached(
-            |engine, wasm, dwarf, unsafe_intrinsics_import, state| {
+            |engine, wasm, dwarf, unsafe_intrinsics_import, state, cancel| {
                 super::build_component_artifacts(
                     engine,
                     wasm,
                     dwarf,
                     unsafe_intrinsics_import,
                     state,
+                    cancel,
                 )
             },
             &custom_alignment,

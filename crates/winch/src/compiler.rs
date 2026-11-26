@@ -8,8 +8,9 @@ use wasmtime_cranelift::CompiledFunction;
 use wasmtime_environ::component::ComponentTranslation;
 use wasmtime_environ::error::Result;
 use wasmtime_environ::{
-    CompileError, CompiledFunctionBody, DefinedFuncIndex, FuncKey, FunctionBodyData, FunctionLoc,
-    ModuleTranslation, ModuleTypesBuilder, PrimaryMap, StaticModuleIndex, Tunables, VMOffsets,
+    CompileCancel, CompileError, CompiledFunctionBody, DefinedFuncIndex, FuncKey, FunctionBodyData,
+    FunctionLoc, ModuleTranslation, ModuleTypesBuilder, PrimaryMap, StaticModuleIndex, Tunables,
+    VMOffsets,
 };
 use winch_codegen::{BuiltinFunctions, CallingConvention, TargetIsa};
 
@@ -117,8 +118,14 @@ impl wasmtime_environ::Compiler for Compiler {
         data: FunctionBodyData<'_>,
         types: &ModuleTypesBuilder,
         symbol: &str,
+        cancel: Option<&CompileCancel>,
     ) -> Result<CompiledFunctionBody, CompileError> {
         log::trace!("compiling function: {key:?} = {symbol:?}");
+        // Winch compiles a function in one pass and is not interrupted in
+        // the middle of one; a cancelled compilation stops between functions.
+        if let Some(cancel) = cancel {
+            cancel.check()?;
+        }
 
         let (module_index, def_func_index) = key.unwrap_defined_wasm_function();
         debug_assert_eq!(module_index, translation.module_index());
@@ -181,8 +188,10 @@ impl wasmtime_environ::Compiler for Compiler {
         obj: &mut Object<'static>,
         funcs: &[(String, FuncKey, Box<dyn Any + Send + Sync>)],
         resolve_reloc: &dyn Fn(usize, wasmtime_environ::FuncKey) -> usize,
+        cancel: Option<&CompileCancel>,
     ) -> Result<Vec<(Option<SymbolId>, FunctionLoc)>> {
-        self.trampolines.append_code(obj, funcs, resolve_reloc)
+        self.trampolines
+            .append_code(obj, funcs, resolve_reloc, cancel)
     }
 
     fn triple(&self) -> &target_lexicon::Triple {
@@ -235,6 +244,15 @@ impl wasmtime_environ::Compiler for Compiler {
     }
 }
 
+/// The error of `InliningCompiler::finish_compiling` as a `CompileError`: a
+/// cancellation keeps its identity, anything else becomes text.
+fn finish_error(error: wasmtime_environ::error::Error) -> CompileError {
+    match error.downcast_ref::<CompileError>() {
+        Some(CompileError::Cancelled) => CompileError::Cancelled,
+        _ => CompileError::Codegen(error.to_string()),
+    }
+}
+
 /// A wrapper around another `Compiler` implementation that may or may not be an
 /// inlining compiler and turns it into a non-inlining compiler.
 struct NoInlineCompiler(Box<dyn wasmtime_environ::Compiler>);
@@ -251,14 +269,15 @@ impl wasmtime_environ::Compiler for NoInlineCompiler {
         data: FunctionBodyData<'_>,
         types: &ModuleTypesBuilder,
         symbol: &str,
+        cancel: Option<&CompileCancel>,
     ) -> Result<CompiledFunctionBody, CompileError> {
         let input = data.body.clone();
         let mut body = self
             .0
-            .compile_function(translation, key, data, types, symbol)?;
+            .compile_function(translation, key, data, types, symbol, cancel)?;
         if let Some(c) = self.0.inlining_compiler() {
-            c.finish_compiling(&mut body, Some(input), symbol)
-                .map_err(|e| CompileError::Codegen(e.to_string()))?;
+            c.finish_compiling(&mut body, Some(input), symbol, cancel)
+                .map_err(finish_error)?;
         }
         Ok(body)
     }
@@ -272,8 +291,8 @@ impl wasmtime_environ::Compiler for NoInlineCompiler {
     ) -> Result<CompiledFunctionBody, CompileError> {
         let mut body = self.0.compile_trampoline(translation, key, types, symbol)?;
         if let Some(c) = self.0.inlining_compiler() {
-            c.finish_compiling(&mut body, None, symbol)
-                .map_err(|e| CompileError::Codegen(e.to_string()))?;
+            c.finish_compiling(&mut body, None, symbol, None)
+                .map_err(finish_error)?;
         }
         Ok(body)
     }
@@ -290,8 +309,9 @@ impl wasmtime_environ::Compiler for NoInlineCompiler {
         obj: &mut Object<'static>,
         funcs: &[(String, FuncKey, Box<dyn Any + Send + Sync>)],
         resolve_reloc: &dyn Fn(usize, FuncKey) -> usize,
+        cancel: Option<&CompileCancel>,
     ) -> Result<Vec<(Option<SymbolId>, FunctionLoc)>> {
-        self.0.append_code(obj, funcs, resolve_reloc)
+        self.0.append_code(obj, funcs, resolve_reloc, cancel)
     }
 
     fn triple(&self) -> &target_lexicon::Triple {
@@ -349,8 +369,8 @@ impl wasmtime_environ::component::ComponentCompiler for NoInlineCompiler {
             .component_compiler()
             .compile_component_trampoline(component, types, key, abi, tunables, symbol)?;
         if let Some(c) = self.0.inlining_compiler() {
-            c.finish_compiling(&mut body, None, symbol)
-                .map_err(|e| CompileError::Codegen(e.to_string()))?;
+            c.finish_compiling(&mut body, None, symbol, None)
+                .map_err(finish_error)?;
         }
         Ok(body)
     }
@@ -369,8 +389,8 @@ impl wasmtime_environ::component::ComponentCompiler for NoInlineCompiler {
             .component_compiler()
             .compile_intrinsic(tunables, component, types, intrinsic, abi, symbol)?;
         if let Some(c) = self.0.inlining_compiler() {
-            c.finish_compiling(&mut body, None, symbol)
-                .map_err(|e| CompileError::Codegen(e.to_string()))?;
+            c.finish_compiling(&mut body, None, symbol, None)
+                .map_err(finish_error)?;
         }
         Ok(body)
     }

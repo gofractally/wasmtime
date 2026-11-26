@@ -28,7 +28,7 @@ use crate::hash_set::HashSet;
 use crate::prelude::*;
 use std::{any::Any, borrow::Cow, mem, ops::Range};
 use wasmtime_environ::{
-    Abi, CompiledFunctionBody, CompiledFunctionsTable, CompiledFunctionsTableBuilder,
+    Abi, CompileError, CompiledFunctionBody, CompiledFunctionsTable, CompiledFunctionsTableBuilder,
     CompiledModuleInfo, Compiler, DefinedFuncIndex, FilePos, FinishedObject, FuncKey,
     FunctionBodyData, Inlining, InliningCompiler, ModuleEnvironment, ModuleTranslation,
     ModuleTypes, ModuleTypesBuilder, ObjectKind, PrimaryMap, StaticModuleIndex, Tunables,
@@ -45,6 +45,69 @@ pub use self::code_builder::{CodeBuilder, CodeHint, HashedEngineCompileEnv};
 #[cfg(feature = "runtime")]
 mod runtime;
 
+#[cfg(all(test, feature = "runtime", feature = "cranelift", feature = "wat"))]
+mod cancel_tests;
+
+pub use wasmtime_environ::CompileCancel;
+
+/// The error of a compilation that was abandoned because its
+/// [`CompileCancel`] handle was set.
+///
+/// A cancelled [`CodeBuilder`] compilation fails with an [`Error`] for which
+/// `error.is::<CompileCancelled>()` holds. It says nothing about the module:
+/// nothing was produced, cached or registered, and the same bytes can be
+/// compiled again, with a new handle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompileCancelled;
+
+impl core::fmt::Display for CompileCancelled {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("compilation was cancelled")
+    }
+}
+
+impl core::error::Error for CompileCancelled {}
+
+/// Fails with [`CompileCancelled`] once `cancel` has been set.
+#[inline]
+fn check_cancel(cancel: Option<&CompileCancel>) -> Result<()> {
+    match cancel {
+        Some(cancel) if cancel.is_cancelled() => Err(Error::new(CompileCancelled)),
+        _ => Ok(()),
+    }
+}
+
+/// Did this compilation fail because it was cancelled, whichever layer
+/// noticed?
+fn is_cancellation(error: &Error) -> bool {
+    error.is::<CompileCancelled>()
+        || matches!(
+            error.downcast_ref::<CompileError>(),
+            Some(CompileError::Cancelled)
+        )
+}
+
+/// The end of a compilation that had a cancellation handle. A cancellation is
+/// reported as a bare [`CompileCancelled`], whichever function happened to
+/// notice it, and the compiler's pooled per-function contexts are released as
+/// they are after a completed compilation: a cancelled compilation is the
+/// likeliest to have grown them.
+fn finish_cancellable<T>(
+    engine: &Engine,
+    cancel: Option<&CompileCancel>,
+    result: Result<T>,
+) -> Result<T> {
+    match result {
+        Err(error) if cancel.is_some() && is_cancellation(&error) => {
+            if let Ok(compiler) = engine.try_compiler() {
+                compiler.release_caches();
+            }
+            Err(Error::new(CompileCancelled))
+        }
+        result => result,
+    }
+}
+
 /// Converts an input binary-encoded WebAssembly module to compilation
 /// artifacts and type information.
 ///
@@ -57,15 +120,35 @@ mod runtime;
 /// Additionally compilation returns an `Option` here which is always
 /// `Some`, notably compiled metadata about the module in addition to the
 /// type information found within.
+///
+/// With a `cancel` handle the compilation stops soon after the handle is set
+/// and the result is an error that is a [`CompileCancelled`]; see
+/// [`CodeBuilder::cancel_handle`].
 pub(crate) fn build_module_artifacts<T: FinishedObject>(
     engine: &Engine,
     wasm: &[u8],
     dwarf_package: Option<&[u8]>,
     obj_state: &T::State,
+    cancel: Option<&CompileCancel>,
 ) -> Result<(
     T,
     Option<(CompiledModuleInfo, CompiledFunctionsTable, ModuleTypes)>,
 )> {
+    let result = build_module_artifacts_impl(engine, wasm, dwarf_package, obj_state, cancel);
+    finish_cancellable(engine, cancel, result)
+}
+
+fn build_module_artifacts_impl<T: FinishedObject>(
+    engine: &Engine,
+    wasm: &[u8],
+    dwarf_package: Option<&[u8]>,
+    obj_state: &T::State,
+    cancel: Option<&CompileCancel>,
+) -> Result<(
+    T,
+    Option<(CompiledModuleInfo, CompiledFunctionsTable, ModuleTypes)>,
+)> {
+    check_cancel(cancel)?;
     let compiler = engine.try_compiler()?;
     let tunables = engine.tunables();
 
@@ -88,14 +171,17 @@ pub(crate) fn build_module_artifacts<T: FinishedObject>(
     prepare_translation(engine, compiler, &mut translation, &mut types);
     let functions = mem::take(&mut translation.function_body_inputs);
 
+    check_cancel(cancel)?;
     let compile_inputs = CompileInputs::for_module(&types, &translation, functions);
-    let unlinked_compile_outputs = compile_inputs.compile(engine, &types)?;
+    let unlinked_compile_outputs = compile_inputs.compile(engine, &types, cancel)?;
+    check_cancel(cancel)?;
     let PreLinkOutput {
         needs_gc_heap,
         compiled_funcs,
         indices,
     } = unlinked_compile_outputs.pre_link();
     translation.module.needs_gc_heap |= needs_gc_heap;
+    check_cancel(cancel)?;
 
     // Emplace all compiled functions into the object file with any other
     // sections associated with code as well.
@@ -118,6 +204,7 @@ pub(crate) fn build_module_artifacts<T: FinishedObject>(
         compiled_funcs,
         std::iter::once(translation).collect(),
         dwarf_package,
+        cancel,
     )?;
 
     if tunables.debug_guest {
@@ -127,6 +214,9 @@ pub(crate) fn build_module_artifacts<T: FinishedObject>(
     let (info, index) = compilation_artifacts.unwrap_as_module_info();
     let types = types.finish();
     object.serialize_info(&(&info, &index, &types));
+    // The last look at the handle: from here on the artifact is complete and
+    // the compilation counts as finished.
+    check_cancel(cancel)?;
     let result = T::finish_object(object, obj_state)?;
 
     compiler.release_caches();
@@ -148,12 +238,34 @@ pub(crate) fn build_component_artifacts<T: FinishedObject>(
     _dwarf_package: Option<&[u8]>,
     unsafe_intrinsics_import: Option<&str>,
     obj_state: &T::State,
+    cancel: Option<&CompileCancel>,
+) -> Result<(T, Option<wasmtime_environ::component::ComponentArtifacts>)> {
+    let result = build_component_artifacts_impl(
+        engine,
+        binary,
+        _dwarf_package,
+        unsafe_intrinsics_import,
+        obj_state,
+        cancel,
+    );
+    finish_cancellable(engine, cancel, result)
+}
+
+#[cfg(feature = "component-model")]
+fn build_component_artifacts_impl<T: FinishedObject>(
+    engine: &Engine,
+    binary: &[u8],
+    _dwarf_package: Option<&[u8]>,
+    unsafe_intrinsics_import: Option<&str>,
+    obj_state: &T::State,
+    cancel: Option<&CompileCancel>,
 ) -> Result<(T, Option<wasmtime_environ::component::ComponentArtifacts>)> {
     use wasmtime_environ::ScopeVec;
     use wasmtime_environ::component::{
         CompiledComponentInfo, ComponentArtifacts, ComponentTypesBuilder,
     };
 
+    check_cancel(cancel)?;
     let compiler = engine.try_compiler()?;
     let tunables = engine.tunables();
 
@@ -186,7 +298,9 @@ pub(crate) fn build_component_artifacts<T: FinishedObject>(
             (i, &*translation, functions)
         }),
     );
-    let unlinked_compile_outputs = compile_inputs.compile(&engine, types.module_types_builder())?;
+    let unlinked_compile_outputs =
+        compile_inputs.compile(&engine, types.module_types_builder(), cancel)?;
+    check_cancel(cancel)?;
 
     let PreLinkOutput {
         needs_gc_heap,
@@ -217,6 +331,7 @@ pub(crate) fn build_component_artifacts<T: FinishedObject>(
         compiled_funcs,
         module_translations,
         None, // TODO: Support dwarf packages for components.
+        cancel,
     )?;
 
     if tunables.debug_guest {
@@ -240,6 +355,7 @@ pub(crate) fn build_component_artifacts<T: FinishedObject>(
 
     compiler.release_caches();
 
+    check_cancel(cancel)?;
     let result = T::finish_object(object, obj_state)?;
     Ok((result, Some(artifacts)))
 }
@@ -264,7 +380,8 @@ fn prepare_translation(
     translation.finalize_table_init(engine.tunables(), types);
 }
 
-type CompileInput<'a> = Box<dyn FnOnce(&dyn Compiler) -> Result<CompileOutput<'a>> + Send + 'a>;
+type CompileInput<'a> =
+    Box<dyn FnOnce(&dyn Compiler, Option<&CompileCancel>) -> Result<CompileOutput<'a>> + Send + 'a>;
 
 struct CompileOutput<'a> {
     key: FuncKey,
@@ -299,7 +416,7 @@ struct CompileInputs<'a> {
 impl<'a> CompileInputs<'a> {
     fn push_input(
         &mut self,
-        f: impl FnOnce(&dyn Compiler) -> Result<CompileOutput<'a>> + Send + 'a,
+        f: impl FnOnce(&dyn Compiler, Option<&CompileCancel>) -> Result<CompileOutput<'a>> + Send + 'a,
     ) {
         self.inputs.push(Box::new(f));
     }
@@ -350,7 +467,7 @@ impl<'a> CompileInputs<'a> {
             let i = u32::try_from(i).unwrap();
             let intrinsic = UnsafeIntrinsic::from_u32(i);
             for abi in [Abi::Wasm, Abi::Array] {
-                ret.push_input(move |compiler| {
+                ret.push_input(move |compiler, _cancel| {
                     let symbol = format!(
                         "unsafe-intrinsics-{}-{}",
                         match abi {
@@ -377,7 +494,7 @@ impl<'a> CompileInputs<'a> {
 
         for (idx, trampoline) in component.trampolines.iter() {
             for abi in [Abi::Wasm, Abi::Array] {
-                ret.push_input(move |compiler| {
+                ret.push_input(move |compiler, _cancel| {
                     let key = FuncKey::ComponentTrampoline(abi, idx);
                     let symbol = format!(
                         "component-trampolines[{}]-{}-{}",
@@ -417,7 +534,7 @@ impl<'a> CompileInputs<'a> {
                 .find_resource_drop_signature()
                 .is_some()
             {
-                ret.push_input(move |compiler| {
+                ret.push_input(move |compiler, _cancel| {
                     let key = FuncKey::ResourceDropTrampoline;
                     let symbol = "resource_drop_trampoline".to_string();
                     let function = compiler
@@ -481,7 +598,7 @@ impl<'a> CompileInputs<'a> {
     ) {
         for (module, translation, functions) in translations {
             for (def_func_index, func_body_data) in functions {
-                self.push_input(move |compiler| {
+                self.push_input(move |compiler, cancel| {
                     let key = FuncKey::DefinedWasmFunction(module, def_func_index);
                     let func_index = translation.module.func_index(def_func_index);
                     let symbol = match translation
@@ -507,7 +624,7 @@ impl<'a> CompileInputs<'a> {
                     let offset = data.original_position();
                     let start_srcloc = FilePos::new(u32::try_from(offset).unwrap());
                     let function = compiler
-                        .compile_function(translation, key, func_body_data, types, &symbol)
+                        .compile_function(translation, key, func_body_data, types, &symbol, cancel)
                         .with_context(|| format!("failed to compile: {symbol}"))?;
 
                     Ok(CompileOutput {
@@ -522,7 +639,7 @@ impl<'a> CompileInputs<'a> {
 
                 let func_index = translation.module.func_index(def_func_index);
                 if translation.module.functions[func_index].is_escaping() {
-                    self.push_input(move |compiler| {
+                    self.push_input(move |compiler, _cancel| {
                         let key = FuncKey::ArrayToWasmTrampoline(module, def_func_index);
                         let func_index = translation.module.func_index(def_func_index);
                         let symbol = format!(
@@ -547,7 +664,7 @@ impl<'a> CompileInputs<'a> {
 
             if !translation.module.startup.is_none() {
                 for abi in [Abi::Wasm, Abi::Array] {
-                    self.push_input(move |compiler| {
+                    self.push_input(move |compiler, _cancel| {
                         let key = FuncKey::ModuleStartup(abi, module);
                         let symbol = format!("module_start[{}]::{abi:?}", module.as_u32());
                         let function = compiler
@@ -572,7 +689,7 @@ impl<'a> CompileInputs<'a> {
             if !is_new {
                 continue;
             }
-            self.push_input(move |compiler| {
+            self.push_input(move |compiler, _cancel| {
                 let key = FuncKey::WasmToArrayTrampoline(trampoline_type_index);
                 let symbol = format!(
                     "signatures[{}]::wasm_to_array_trampoline",
@@ -595,10 +712,17 @@ impl<'a> CompileInputs<'a> {
 
     /// Compile these `CompileInput`s (maybe in parallel) and return the
     /// resulting `UnlinkedCompileOutput`s.
+    ///
+    /// With a `cancel` handle, every unit of work looks at the handle before
+    /// it does anything else, so once the handle is set no further function
+    /// is started and the batch drains at once; the functions already in the
+    /// compiler notice between their passes and inside register allocation.
+    /// The result is then an error and none of the outputs survive.
     fn compile(
         self,
         engine: &Engine,
         types: &'a ModuleTypesBuilder,
+        cancel: Option<&CompileCancel>,
     ) -> Result<UnlinkedCompileOutputs<'a>> {
         let compiler = engine.try_compiler()?;
 
@@ -622,24 +746,29 @@ the use case.
 
         let mut raw_outputs = if let Some(inlining_compiler) = compiler.inlining_compiler() {
             if engine.tunables().inlining != Inlining::No {
-                self.compile_with_inlining(engine, compiler, inlining_compiler)?
+                self.compile_with_inlining(engine, compiler, inlining_compiler, cancel)?
             } else {
                 // Inlining compiler but inlining is disabled: compile each
                 // input and immediately finish its output in parallel, skipping
                 // call graph computation and all that.
                 engine.run_maybe_parallel::<_, _, Error, _>(self.inputs, |f| {
-                    let mut compiled = f(compiler)?;
+                    check_cancel(cancel)?;
+                    let mut compiled = f(compiler, cancel)?;
                     inlining_compiler.finish_compiling(
                         &mut compiled.function,
                         compiled.func_body.take(),
                         &compiled.symbol,
+                        cancel,
                     )?;
                     Ok(compiled)
                 })?
             }
         } else {
             // No inlining: just compile each individual input in parallel.
-            engine.run_maybe_parallel(self.inputs, |f| f(compiler))?
+            engine.run_maybe_parallel(self.inputs, |f| {
+                check_cancel(cancel)?;
+                f(compiler, cancel)
+            })?
         };
 
         if cfg!(debug_assertions) {
@@ -657,7 +786,8 @@ the use case.
         // wasmtime-builtin functions are necessary. If so those need to be
         // collected and then those trampolines additionally need to be
         // compiled.
-        compile_required_builtins(engine, types, &mut raw_outputs)?;
+        check_cancel(cancel)?;
+        compile_required_builtins(engine, types, &mut raw_outputs, cancel)?;
 
         // Sort the outputs by their `FuncKey` which enables deterministically
         // linking this output by function kind.
@@ -672,11 +802,16 @@ the use case.
         engine: &Engine,
         compiler: &dyn Compiler,
         inlining_compiler: &dyn InliningCompiler,
+        cancel: Option<&CompileCancel>,
     ) -> Result<Vec<CompileOutput<'a>>, Error> {
         // Our list of unlinked outputs.
         let mut outputs = PrimaryMap::<OutputIndex, Option<CompileOutput<'_>>>::from(
-            engine.run_maybe_parallel(self.inputs, |f| f(compiler).map(Some))?,
+            engine.run_maybe_parallel(self.inputs, |f| {
+                check_cancel(cancel)?;
+                f(compiler, cancel).map(Some)
+            })?,
         );
+        check_cancel(cancel)?;
 
         // A map from a `FuncKey` to its index in our unlinked outputs.
         //
@@ -739,6 +874,7 @@ the use case.
         }));
         let mut layer_outputs = vec![];
         for layer in strata.layers() {
+            check_cancel(cancel)?;
             // Temporarily take this layer's outputs out of our unlinked outputs
             // list so that we can mutate these outputs (by inlining callee
             // functions into them) while also accessing shared borrows of the
@@ -808,11 +944,13 @@ the use case.
 
         // Fan out in parallel again and finish compiling each function.
         engine.run_maybe_parallel(outputs.into(), |output| {
+            check_cancel(cancel)?;
             let mut output = output.unwrap();
             inlining_compiler.finish_compiling(
                 &mut output.function,
                 output.func_body.take(),
                 &output.symbol,
+                cancel,
             )?;
             Ok(output)
         })
@@ -996,13 +1134,14 @@ fn compile_required_builtins<'a>(
     engine: &Engine,
     types: &'a ModuleTypesBuilder,
     raw_outputs: &mut Vec<CompileOutput<'a>>,
+    cancel: Option<&CompileCancel>,
 ) -> Result<()> {
     let compiler = engine.try_compiler()?;
     let mut builtins = HashSet::new();
     let mut new_inputs: Vec<CompileInput<'_>> = Vec::new();
 
     let compile_builtin = |key: FuncKey| {
-        Box::new(move |compiler: &dyn Compiler| {
+        Box::new(move |compiler: &dyn Compiler, _: Option<&CompileCancel>| {
             let symbol = match key {
                 FuncKey::WasmToBuiltinTrampoline(builtin) => {
                     format!("wasmtime_builtin_{}", builtin.name())
@@ -1016,7 +1155,7 @@ fn compile_required_builtins<'a>(
                 .compile_trampoline(None, key, types, &symbol)
                 .with_context(|| format!("failed to compile `{symbol}`"))?;
             if let Some(compiler) = compiler.inlining_compiler() {
-                compiler.finish_compiling(&mut function, None, &symbol)?;
+                compiler.finish_compiling(&mut function, None, &symbol, None)?;
             }
             Ok(CompileOutput {
                 key,
@@ -1042,7 +1181,10 @@ fn compile_required_builtins<'a>(
             }
         }
     }
-    raw_outputs.extend(engine.run_maybe_parallel(new_inputs, |c| c(compiler))?);
+    raw_outputs.extend(engine.run_maybe_parallel(new_inputs, |c| {
+        check_cancel(cancel)?;
+        c(compiler, cancel)
+    })?);
     Ok(())
 }
 
@@ -1132,6 +1274,7 @@ impl FunctionIndices {
         compiled_funcs: Vec<(String, FuncKey, Box<dyn Any + Send + Sync>)>,
         translations: PrimaryMap<StaticModuleIndex, ModuleTranslation<'_>>,
         dwarf_package_bytes: Option<&[u8]>,
+        cancel: Option<&CompileCancel>,
     ) -> Result<(wasmtime_environ::ObjectBuilder<'a>, Artifacts)> {
         // Append all the functions to the ELF file.
         //
@@ -1148,7 +1291,9 @@ impl FunctionIndices {
                     panic!("cannot resolve relocation! no index for callee {callee:?}")
                 })
             },
+            cancel,
         )?;
+        check_cancel(cancel)?;
 
         // If requested, generate and add DWARF information.
         if tunables.debug_native {
