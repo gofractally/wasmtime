@@ -1,5 +1,5 @@
-use crate::Engine;
 use crate::prelude::*;
+use crate::{CompileCancel, Engine};
 use std::borrow::Cow;
 use std::path::Path;
 
@@ -47,6 +47,7 @@ pub struct CodeBuilder<'a> {
     dwarf_package: Option<Cow<'a, [u8]>>,
     dwarf_package_path: Option<Cow<'a, Path>>,
     unsafe_intrinsics_import: Option<String>,
+    cancel: Option<CompileCancel>,
 
     /// A map from import name to the Wasm bytes of the associated compile-time
     /// builtin and its file path, if any.
@@ -78,6 +79,7 @@ impl<'a> CodeBuilder<'a> {
             wasm_path: None,
             dwarf_package: None,
             dwarf_package_path: None,
+            cancel: None,
             unsafe_intrinsics_import: None,
             #[cfg(feature = "compile-time-builtins")]
             compile_time_builtins: HashMap::default(),
@@ -743,6 +745,39 @@ impl<'a> CodeBuilder<'a> {
         self.dwarf_package.as_deref()
     }
 
+    /// Makes the compilations started from this builder cancellable through
+    /// `handle`.
+    ///
+    /// Compiling a module can take arbitrarily long: the compiler's cost is
+    /// not bounded by the size of its input. An embedder that stops waiting
+    /// calls [`CompileCancel::cancel`] on (a clone of) the handle, from any
+    /// thread. The compilation then stops: no further function is started,
+    /// and the functions being compiled give up at the next pass boundary or,
+    /// inside register allocation, within its next loop iterations. The
+    /// `compile_*` method returns an error for which
+    /// `error.is::<`[`CompileCancelled`](crate::CompileCancelled)`>()` holds.
+    ///
+    /// A cancelled compilation leaves nothing behind: no module or component
+    /// is created, nothing is registered with the engine, and nothing is
+    /// written to the module cache. (With incremental compilation enabled,
+    /// functions that were completely compiled before the cancellation may
+    /// have been stored in that cache; each such entry is a whole function.)
+    /// The same bytes can be compiled again afterwards, with a new handle.
+    ///
+    /// If the handle is set only after the last function has been compiled
+    /// and linked, the compilation completes normally.
+    ///
+    /// A handle that is never set costs one relaxed atomic load at each place
+    /// the compiler looks at it and changes nothing in the output.
+    pub fn cancel_handle(&mut self, handle: &CompileCancel) -> &mut Self {
+        self.cancel = Some(handle.clone());
+        self
+    }
+
+    pub(super) fn get_cancel_handle(&self) -> Option<&CompileCancel> {
+        self.cancel.as_ref()
+    }
+
     /// Set the DWARF package binary.
     ///
     /// Initializes `dwarf_package` from `dwp_bytes` in preparation for
@@ -811,8 +846,13 @@ impl<'a> CodeBuilder<'a> {
 
         let wasm = self.get_wasm()?;
         let dwarf_package = self.get_dwarf_package();
-        let (v, _) =
-            super::build_module_artifacts(self.engine, &wasm, dwarf_package.as_deref(), &())?;
+        let (v, _) = super::build_module_artifacts(
+            self.engine,
+            &wasm,
+            dwarf_package.as_deref(),
+            &(),
+            self.get_cancel_handle(),
+        )?;
         Ok(v)
     }
 
@@ -828,6 +868,7 @@ impl<'a> CodeBuilder<'a> {
             None,
             self.get_unsafe_intrinsics_import(),
             &(),
+            self.get_cancel_handle(),
         )?;
         Ok(v)
     }

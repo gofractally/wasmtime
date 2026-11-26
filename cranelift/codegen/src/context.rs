@@ -25,7 +25,7 @@ use crate::settings::{FlagsOrIsa, OptLevel};
 use crate::trace;
 use crate::unreachable_code::eliminate_unreachable_code;
 use crate::verifier::{VerifierErrors, VerifierResult, verify_context};
-use crate::{CompileError, timing};
+use crate::{Cancel, CompileError, timing};
 #[cfg(feature = "souper-harvest")]
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -133,19 +133,37 @@ impl Context {
         isa: &dyn TargetIsa,
         ctrl_plane: &mut ControlPlane,
     ) -> CodegenResult<CompiledCodeStencil> {
+        self.compile_stencil_cancellable(isa, ctrl_plane, Cancel::never())
+    }
+
+    /// Like [`Context::compile_stencil`], but gives up with
+    /// [`CodegenError::Cancelled`](crate::CodegenError::Cancelled) soon after
+    /// `cancel` is set. The flag is looked at between passes and inside
+    /// register allocation.
+    ///
+    /// After a cancelled compilation this context holds a half-processed
+    /// function: `clear` it before reusing it, or drop it.
+    pub fn compile_stencil_cancellable(
+        &mut self,
+        isa: &dyn TargetIsa,
+        ctrl_plane: &mut ControlPlane,
+        cancel: Cancel<'_>,
+    ) -> CodegenResult<CompiledCodeStencil> {
         let result;
         trace!("****** START compiling {}", self.func.display_spec());
         {
             let _tt = timing::compile();
 
+            cancel.check()?;
             self.verify_if(isa)?;
-            self.optimize(isa, ctrl_plane)?;
+            self.optimize_cancellable(isa, ctrl_plane, cancel)?;
             result = isa.compile_function(
                 &self.func,
                 &self.domtree,
                 &mut self.regalloc_ctx,
                 self.want_disasm,
                 ctrl_plane,
+                cancel,
             );
         }
         trace!("****** DONE compiling {}\n", self.func.display_spec());
@@ -161,6 +179,16 @@ impl Context {
         &mut self,
         isa: &dyn TargetIsa,
         ctrl_plane: &mut ControlPlane,
+    ) -> CodegenResult<()> {
+        self.optimize_cancellable(isa, ctrl_plane, Cancel::never())
+    }
+
+    /// Like [`Context::optimize`], but looks at `cancel` between passes.
+    pub fn optimize_cancellable(
+        &mut self,
+        isa: &dyn TargetIsa,
+        ctrl_plane: &mut ControlPlane,
+        cancel: Cancel<'_>,
     ) -> CodegenResult<()> {
         log::debug!(
             "Number of CLIF instructions to optimize: {}",
@@ -180,19 +208,24 @@ impl Context {
 
         if isa.flags().enable_nan_canonicalization() {
             self.canonicalize_nans(isa)?;
+            cancel.check()?;
         }
 
         self.verify_if(isa)?;
 
         self.compute_cfg();
         self.compute_domtree();
+        cancel.check()?;
         self.eliminate_unreachable_code(isa)?;
+        cancel.check()?;
         self.remove_constant_phis(isa)?;
+        cancel.check()?;
 
         self.func.dfg.resolve_all_aliases();
 
         if opt_level != OptLevel::None {
             self.egraph_pass(isa, ctrl_plane)?;
+            cancel.check()?;
         }
 
         Ok(())
@@ -222,8 +255,20 @@ impl Context {
         isa: &dyn TargetIsa,
         ctrl_plane: &mut ControlPlane,
     ) -> CompileResult<'_, &CompiledCode> {
+        self.compile_cancellable(isa, ctrl_plane, Cancel::never())
+    }
+
+    /// Like [`Context::compile`], but gives up with
+    /// [`CodegenError::Cancelled`](crate::CodegenError::Cancelled) soon after
+    /// `cancel` is set; see [`Context::compile_stencil_cancellable`].
+    pub fn compile_cancellable(
+        &mut self,
+        isa: &dyn TargetIsa,
+        ctrl_plane: &mut ControlPlane,
+        cancel: Cancel<'_>,
+    ) -> CompileResult<'_, &CompiledCode> {
         let stencil = self
-            .compile_stencil(isa, ctrl_plane)
+            .compile_stencil_cancellable(isa, ctrl_plane, cancel)
             .map_err(|error| CompileError {
                 inner: error,
                 func: &self.func,

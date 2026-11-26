@@ -40,6 +40,11 @@ pub enum CodegenError {
 
     /// Register allocator internal error discovered by the symbolic checker.
     Regalloc(CheckerErrors),
+
+    /// The compilation was abandoned because its cancellation flag was set;
+    /// see [`Cancel`](crate::Cancel). This says nothing about the function,
+    /// which may well compile if tried again.
+    Cancelled,
 }
 
 /// A convenient alias for a `Result` that uses `CodegenError` as the error type.
@@ -57,6 +62,7 @@ impl core::error::Error for CodegenError {
             #[cfg(feature = "unwind")]
             CodegenError::RegisterMappingError { .. } => None,
             CodegenError::Regalloc(..) => None,
+            CodegenError::Cancelled => None,
         }
     }
 }
@@ -71,6 +77,7 @@ impl core::fmt::Display for CodegenError {
             #[cfg(feature = "unwind")]
             CodegenError::RegisterMappingError(_0) => write!(f, "Register mapping error"),
             CodegenError::Regalloc(errors) => write!(f, "Regalloc validation errors: {errors:?}"),
+            CodegenError::Cancelled => write!(f, "Compilation was cancelled"),
         }
     }
 }

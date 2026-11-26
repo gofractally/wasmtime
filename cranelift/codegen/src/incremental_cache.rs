@@ -28,7 +28,7 @@ use crate::ir::Function;
 use crate::ir::function::{FunctionStencil, VersionMarker};
 use crate::machinst::{CompiledCode, CompiledCodeStencil};
 use crate::result::CompileResult;
-use crate::{CompileError, Context, trace};
+use crate::{Cancel, CompileError, Context, trace};
 use crate::{isa::TargetIsa, timing};
 use alloc::borrow::Cow;
 use cranelift_control::ControlPlane;
@@ -42,6 +42,20 @@ impl Context {
         cache_store: &mut dyn CacheKvStore,
         ctrl_plane: &mut ControlPlane,
     ) -> CompileResult<'_, (&CompiledCode, bool)> {
+        self.compile_with_cache_cancellable(isa, cache_store, ctrl_plane, Cancel::never())
+    }
+
+    /// Like [`Context::compile_with_cache`], but gives up with
+    /// [`CodegenError::Cancelled`](crate::CodegenError::Cancelled) soon after
+    /// `cancel` is set. Nothing is put into the cache for a cancelled
+    /// compilation.
+    pub fn compile_with_cache_cancellable(
+        &mut self,
+        isa: &dyn TargetIsa,
+        cache_store: &mut dyn CacheKvStore,
+        ctrl_plane: &mut ControlPlane,
+        cancel: Cancel<'_>,
+    ) -> CompileResult<'_, (&CompiledCode, bool)> {
         let cache_key_hash = {
             let _tt = timing::try_incremental_cache();
 
@@ -53,7 +67,8 @@ impl Context {
                         let info = compiled_code.code_info();
 
                         if isa.flags().enable_incremental_compilation_cache_checks() {
-                            let actual_result = self.compile(isa, ctrl_plane)?;
+                            let actual_result =
+                                self.compile_cancellable(isa, ctrl_plane, cancel)?;
                             assert_eq!(*actual_result, compiled_code);
                             assert_eq!(actual_result.code_info(), info);
                             // no need to set `compiled_code` here, it's set by `compile()`.
@@ -73,7 +88,7 @@ impl Context {
         };
 
         let stencil = self
-            .compile_stencil(isa, ctrl_plane)
+            .compile_stencil_cancellable(isa, ctrl_plane, cancel)
             .map_err(|err| CompileError {
                 inner: err,
                 func: &self.func,

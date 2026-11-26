@@ -1243,6 +1243,7 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
         mut self,
         backend: &B,
         ctrl_plane: &mut ControlPlane,
+        cancel: crate::Cancel<'_>,
     ) -> CodegenResult<VCode<I>> {
         trace!("about to lower function: {:?}", self.f);
 
@@ -1260,6 +1261,7 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
         // Main lowering loop over lowered blocks.
         let num_blocks = self.vcode.block_order().lowered_order().len();
         for i in (0..num_blocks).rev() {
+            cancel.check()?;
             // We index into the (immutable) lowered order one block at a time,
             // copying the block out, so that the immutable borrow of
             // `self.vcode` ends immediately and leaves `&mut self` free for

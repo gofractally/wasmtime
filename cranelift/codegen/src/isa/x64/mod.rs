@@ -63,6 +63,7 @@ impl X64Backend {
         domtree: &DominatorTree,
         regalloc_ctx: &mut regalloc2::Ctx,
         ctrl_plane: &mut ControlPlane,
+        cancel: crate::Cancel<'_>,
     ) -> CodegenResult<VCode<inst::Inst>> {
         // This performs lowering to VCode, register-allocates the code, computes
         // block layout and finalizes branches. The result is ready for binary emission.
@@ -78,6 +79,7 @@ impl X64Backend {
             emit_info,
             sigs,
             ctrl_plane,
+            cancel,
         )
     }
 }
@@ -90,10 +92,17 @@ impl TargetIsa for X64Backend {
         regalloc_ctx: &mut regalloc2::Ctx,
         want_disasm: bool,
         ctrl_plane: &mut ControlPlane,
+        cancel: crate::Cancel<'_>,
     ) -> CodegenResult<CompiledCodeStencil> {
-        let vcode = self.compile_vcode(func, domtree, regalloc_ctx, ctrl_plane)?;
+        let vcode = self.compile_vcode(func, domtree, regalloc_ctx, ctrl_plane, cancel)?;
 
-        let emit_result = vcode.emit(&regalloc_ctx.output, want_disasm, &self.flags, ctrl_plane)?;
+        let emit_result = vcode.emit(
+            &regalloc_ctx.output,
+            want_disasm,
+            &self.flags,
+            ctrl_plane,
+            cancel,
+        )?;
         let value_labels_ranges = emit_result.value_labels_ranges;
         let buffer = emit_result.buffer;
 

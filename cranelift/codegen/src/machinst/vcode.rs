@@ -739,6 +739,7 @@ impl<I: VCodeInst> VCode<I> {
         want_disasm: bool,
         flags: &settings::Flags,
         ctrl_plane: &mut ControlPlane,
+        cancel: crate::Cancel<'_>,
     ) -> CodegenResult<EmitResult>
     where
         I: VCodeInst,
@@ -821,6 +822,7 @@ impl<I: VCodeInst> VCode<I> {
         let mut total_bb_padding = 0;
 
         for &block in final_order.iter() {
+            cancel.check()?;
             trace!("emitting block {:?}", block);
 
             // Call the new block hook for state
