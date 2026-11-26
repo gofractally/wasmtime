@@ -753,6 +753,23 @@ fn new_epoch(store: &mut dyn VMStore, _instance: InstanceId) -> Result<NextEpoch
         store.block_on_debug_handler(crate::DebugEvent::EpochYield)?;
     }
 
+    // The epoch this store has been made to look at. It is read BEFORE the
+    // callback runs, and `Continue` measures the next deadline from it, not
+    // from the epoch as it is when the callback has returned.
+    //
+    // An embedder may use a tick as a signal ("look at your state now"): it
+    // changes something the callback reads and then increments the epoch.
+    // If the next deadline were measured from an epoch read after the
+    // callback, a tick that arrives while the callback is running, or just
+    // after it has read the embedder's state, would move the deadline past
+    // itself: the callback has already answered "continue" from the old
+    // state, the deadline would become that tick plus the delta, and unless
+    // the embedder ticks again the new state would never be looked at.
+    // Measured from the epoch read here, every tick after this point is at
+    // or beyond the next deadline for a delta of one, so the store looks
+    // again; and a tick before this point happened before the callback ran,
+    // which therefore saw the state that went with it.
+    let observed_epoch = store.engine().current_epoch();
     let update_deadline = store.new_epoch_updated_deadline()?;
     block_on!(store, async move |store, asyncness| {
         #[cfg(not(feature = "async"))]
@@ -760,7 +777,14 @@ fn new_epoch(store: &mut dyn VMStore, _instance: InstanceId) -> Result<NextEpoch
 
         let delta = match update_deadline {
             UpdateDeadline::Interrupt => return Err(Trap::Interrupt.into()),
-            UpdateDeadline::Continue(delta) => delta,
+            UpdateDeadline::Continue(delta) => {
+                // See `observed_epoch` above. (The yielding variants below
+                // keep measuring from the epoch after the yield: ticks go on
+                // while the task is suspended, and a task that is resumed
+                // late must still be allowed to run.)
+                store.set_epoch_deadline_from(observed_epoch, delta);
+                return Ok(NextEpoch(store.get_epoch_deadline()));
+            }
 
             // Note that custom errors are used here to avoid tripping up on the
             // `block_on!` message that otherwise assumes

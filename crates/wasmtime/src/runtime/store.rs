@@ -391,6 +391,14 @@ pub enum UpdateDeadline {
     /// raise a trap.
     Interrupt,
     /// Extend the deadline by the specified number of ticks.
+    ///
+    /// The ticks are counted from the epoch at which the store was made to
+    /// look, that is, from before the callback ran: a tick that arrives
+    /// while the callback is running counts towards the new deadline. With
+    /// `Continue(1)` the callback is therefore called again after every
+    /// tick, including one that arrived during the previous call, which is
+    /// what an embedder needs that changes state the callback reads and
+    /// then ticks once to have it looked at.
     Continue(u64),
     /// Extend the deadline by the specified number of ticks after yielding to
     /// the async executor loop.
@@ -2398,6 +2406,15 @@ at https://bytecodealliance.org/security.
         let current_epoch = self.engine().current_epoch();
         let epoch_deadline = self.vm_store_context.epoch_deadline.get_mut();
         *epoch_deadline = current_epoch.saturating_add(delta).min(u64::MAX - 1);
+    }
+
+    /// Sets the deadline `delta` ticks beyond `epoch`, an epoch read
+    /// earlier, instead of beyond the current one. Used when a deadline
+    /// callback answers `Continue`: see `new_epoch` in `vm/libcalls.rs` for
+    /// why the epoch must be the one read before the callback ran.
+    pub(crate) fn set_epoch_deadline_from(&mut self, epoch: u64, delta: u64) {
+        let epoch_deadline = self.vm_store_context.epoch_deadline.get_mut();
+        *epoch_deadline = epoch.saturating_add(delta).min(u64::MAX - 1);
     }
 
     pub(crate) fn get_epoch_deadline(&mut self) -> u64 {
