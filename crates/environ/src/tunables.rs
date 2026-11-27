@@ -66,6 +66,10 @@ define_tunables! {
         /// Enforce psizam's deterministic stack budget in every function's
         /// prologue. See `crates/environ/src/psizam.rs`.
         pub psizam_stack_meter: bool,
+        /// With `psizam_stack_meter`: the most native stack bytes a function
+        /// may take per byte of its stack cost, or 0 for no such constraint.
+        /// See `Config::psizam_native_frame_ratio`.
+        pub psizam_native_frame_ratio: u32,
         /// Compute relaxed multiply-add as a multiply followed by an add, each
         /// rounded, which is the WebAssembly deterministic profile's
         /// definition. Without it the result is a fused multiply-add.
@@ -268,6 +272,7 @@ impl Tunables {
         Tunables {
             psizam_memory16: false,
             psizam_stack_meter: false,
+            psizam_native_frame_ratio: 0,
             psizam_unfused_madd: false,
             collector: None,
 

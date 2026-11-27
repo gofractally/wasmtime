@@ -63,7 +63,13 @@ fn psizam_stack_meter_fails_the_same_call_for_a_given_budget() -> Result<()> {
     let indirect = instance.get_typed_func::<(), i32>(&mut store, "indirect")?;
 
     // `down(n)` makes n + 1 frames of 100 bytes.
-    for (budget, deepest) in [(100u64, 0i32), (199, 0), (200, 1), (1000, 9), (100_000, 999)] {
+    for (budget, deepest) in [
+        (100u64, 0i32),
+        (199, 0),
+        (200, 1),
+        (1000, 9),
+        (100_000, 999),
+    ] {
         store.psizam_set_stack_remaining(budget);
         down.call(&mut store, deepest)?;
         // A call leaves the budget as it found it.
@@ -212,7 +218,9 @@ fn psizam_stack_meter_leaves_the_start_function_to_the_embedder() -> Result<()> 
     // nothing remains for it.
     let eager = Module::new(&engine, module_bytes(text, &[50, 0]))?;
     let mut store = Store::new(&engine, ());
-    assert!(overflowed(Instance::new(&mut store, &eager, &[]).map(|_| ())));
+    assert!(overflowed(
+        Instance::new(&mut store, &eager, &[]).map(|_| ())
+    ));
 
     let mut deferring = module_bytes(text, &[50, 0]);
     let name = wasmtime_environ::PSIZAM_DEFER_START_SECTION.as_bytes();
@@ -280,5 +288,175 @@ fn psizam_unfused_madd_rounds_the_product_before_adding() -> Result<()> {
         // -a * a + c is the same difference with the sign reversed.
         assert_eq!(nmadd.call(&mut store, (a, a, c))?, -expected);
     }
+    Ok(())
+}
+
+/// `text` assembled with one cost per function, for modules too large for
+/// `module_bytes`' one-byte section size.
+fn large_module_bytes(text: &str, costs: &[u32]) -> Vec<u8> {
+    fn leb(mut n: usize, out: &mut Vec<u8>) {
+        loop {
+            let byte = (n & 0x7f) as u8;
+            n >>= 7;
+            if n == 0 {
+                out.push(byte);
+                return;
+            }
+            out.push(byte | 0x80);
+        }
+    }
+    let mut bytes = wat::parse_str(text).unwrap();
+    let name = wasmtime_environ::PSIZAM_STACK_COSTS_SECTION.as_bytes();
+    bytes.push(0);
+    leb(1 + name.len() + 4 * costs.len(), &mut bytes);
+    bytes.push(name.len() as u8);
+    bytes.extend_from_slice(name);
+    for cost in costs {
+        bytes.extend_from_slice(&cost.to_le_bytes());
+    }
+    bytes
+}
+
+/// A function whose wasm operand stack never holds more than two values, but
+/// which computes `values` pure values before a call and the same ones again
+/// after it. An optimizer computes each once and keeps it across the call.
+fn kept_across_a_call(values: usize) -> String {
+    let mut body = String::new();
+    for _round in 0..2 {
+        for i in 0..values {
+            body.push_str(&format!(
+                "(global.set $g (i32.xor (global.get $g) \
+                   (i32.mul (i32.rotl (local.get 0) (i32.const {})) (i32.const {}))))\n",
+                i % 31 + 1,
+                2 * i + 3
+            ));
+        }
+        if _round == 0 {
+            body.push_str(
+                "(if (local.get 0) (then (call $f (i32.sub (local.get 0) (i32.const 1)))))\n",
+            );
+        }
+    }
+    format!(
+        "(module (global $g (export \"g\") (mut i32) (i32.const 0))
+           (func $f (export \"f\") (param i32) {body}))"
+    )
+}
+
+fn engine_with_ratio(ratio: u32) -> Result<Engine> {
+    let mut config = Config::new();
+    config.psizam_stack_meter(true);
+    config.psizam_native_frame_ratio(ratio);
+    Engine::new(&config)
+}
+
+/// The native stack the test below gives wasm: 16 native bytes for each
+/// byte of a 1 MiB budget, as an embedder that relies on the ratio would.
+const RESERVED: usize = 16 << 20;
+
+fn with_reserved_stack(config: &mut Config) -> &mut Config {
+    config.async_stack_size(RESERVED + (1 << 20));
+    config.max_wasm_stack(RESERVED)
+}
+
+#[test]
+fn psizam_native_frame_ratio_holds_for_a_function_the_optimizer_inflates() -> Result<()> {
+    // On a thread with room for the reservation and for the host's frames.
+    std::thread::Builder::new()
+        .stack_size(RESERVED + (8 << 20))
+        .spawn(frame_ratio_holds)
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
+fn frame_ratio_holds() -> Result<()> {
+    // 32 is what psizam charges this function: 16, a 4-byte parameter and a
+    // deepest operand stack of 12 bytes.
+    let wasm = large_module_bytes(&kept_across_a_call(2000), &[32]);
+    let run = |engine: &Engine, depth: i32| -> Result<i32> {
+        let module = Module::new(engine, &wasm)?;
+        let mut store = Store::new(engine, ());
+        let instance = Instance::new(&mut store, &module, &[])?;
+        store.psizam_set_stack_remaining(1 << 20);
+        instance
+            .get_typed_func::<i32, ()>(&mut store, "f")?
+            .call(&mut store, depth)?;
+        Ok(instance
+            .get_global(&mut store, "g")
+            .unwrap()
+            .get(&mut store)
+            .unwrap_i32())
+    };
+
+    // Unconstrained, the optimizer is free to keep all 2,000 values.
+    let mut config = Config::new();
+    config.psizam_stack_meter(true);
+    let unconstrained = run(&Engine::new(with_reserved_stack(&mut config))?, 50)?;
+
+    // Constrained to 16 native bytes per cost byte, i.e. 512 bytes for this
+    // function, it is compiled without the optimizer and computes the same.
+    let before = crate::psizam_unoptimized_for_frame();
+    let mut config = Config::new();
+    config.psizam_stack_meter(true);
+    config.psizam_native_frame_ratio(16);
+    let constrained = Engine::new(with_reserved_stack(&mut config))?;
+    assert_eq!(run(&constrained, 50)?, unconstrained);
+    assert!(crate::psizam_unoptimized_for_frame() > before);
+
+    // With every frame at most 512 bytes, the whole budget fits 16 MiB of
+    // native stack: the budget, not the native stack, ends this recursion.
+    // (32,768 frames of 32 bytes are the budget; one more does not fit.)
+    let module = Module::new(&constrained, &wasm)?;
+    let mut store = Store::new(&constrained, ());
+    let instance = Instance::new(&mut store, &module, &[])?;
+    let f = instance.get_typed_func::<i32, ()>(&mut store, "f")?;
+    store.psizam_set_stack_remaining(1 << 20);
+    f.call(&mut store, 32_767)?;
+    store.psizam_set_stack_remaining(1 << 20);
+    assert!(overflowed(f.call(&mut store, 32_768)));
+
+    // Unconstrained, the same depth inside the same budget does not fit the
+    // same native stack: that is the failure the constraint excludes.
+    let mut config = Config::new();
+    config.psizam_stack_meter(true);
+    let engine = Engine::new(with_reserved_stack(&mut config))?;
+    let module = Module::new(&engine, &wasm)?;
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[])?;
+    let f = instance.get_typed_func::<i32, ()>(&mut store, "f")?;
+    store.psizam_set_stack_remaining(1 << 20);
+    assert!(overflowed(f.call(&mut store, 32_767)));
+    Ok(())
+}
+
+#[test]
+fn psizam_native_frame_ratio_refuses_what_it_cannot_satisfy() -> Result<()> {
+    // No frame is as small as its cost when the cost is 1: the function is
+    // not produced, rather than produced with a frame the embedder's
+    // reservation does not cover.
+    let error = Module::new(
+        &engine_with_ratio(1)?,
+        module_bytes(RECURSE, &[1, 1, 1, 1, 1]),
+    )
+    .unwrap_err();
+    let text = format!("{error:?}");
+    assert!(text.contains("psizam: the native frame of"), "{text}");
+
+    // The same module with its real costs satisfies a ratio of 16 as it is.
+    Module::new(
+        &engine_with_ratio(16)?,
+        module_bytes(RECURSE, &RECURSE_COSTS),
+    )?;
+    Ok(())
+}
+
+#[test]
+fn psizam_native_frame_ratio_is_part_of_what_a_module_was_compiled_with() -> Result<()> {
+    let wasm = module_bytes(RECURSE, &RECURSE_COSTS);
+    let bytes = engine_with_ratio(16)?.precompile_module(&wasm)?;
+    assert!(unsafe { Module::deserialize(&engine_with_ratio(16)?, &bytes) }.is_ok());
+    assert!(unsafe { Module::deserialize(&engine_with_ratio(32)?, &bytes) }.is_err());
+    assert!(unsafe { Module::deserialize(&engine()?, &bytes) }.is_err());
     Ok(())
 }

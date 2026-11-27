@@ -50,6 +50,15 @@ mod cancel_tests;
 
 pub use wasmtime_environ::CompileCancel;
 
+/// How many functions this process has compiled without the mid-end
+/// optimizer because their optimized native frame was larger than
+/// [`Config::psizam_native_frame_ratio`](crate::Config::psizam_native_frame_ratio)
+/// allows.
+#[cfg(feature = "cranelift")]
+pub fn psizam_unoptimized_for_frame() -> u64 {
+    wasmtime_cranelift::PSIZAM_UNOPTIMIZED_FOR_FRAME.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// The error of a compilation that was abandoned because its
 /// [`CompileCancel`] handle was set.
 ///

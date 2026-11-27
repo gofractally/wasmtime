@@ -2394,6 +2394,35 @@ impl Config {
         self
     }
 
+    /// Constrain the native frame of every function that has a stack cost
+    /// under [`Config::psizam_stack_meter`]: one activation may take at most
+    /// `ratio` native stack bytes per byte of the function's cost. 0, the
+    /// default, is no constraint.
+    ///
+    /// The stack budget is spent in units of cost, and a chain of calls that
+    /// fits a budget of `B` has costs that sum to at most `B`. If every
+    /// frame is at most `ratio` times its function's cost, the frames of
+    /// such a chain sum to at most `ratio * B`: an embedder that reserves
+    /// that much native stack for wasm frames (plus what the frames that are
+    /// not wasm functions need) knows that no module can run out of native
+    /// stack before it runs out of budget, whatever the module contains.
+    ///
+    /// The constraint is checked against the frame the compiler actually
+    /// laid out, not against a prediction. A function whose optimized frame
+    /// is larger is compiled again without the mid-end optimizer, which is
+    /// what makes frames larger than what the wasm function itself holds
+    /// (it computes a value once and keeps it, across calls too, where the
+    /// function computes it twice). If that frame is still larger the
+    /// compilation fails with an error: nothing is produced that could
+    /// break the embedder's reservation.
+    ///
+    /// The value is part of what a compiled module was built with: an
+    /// engine does not load a module compiled under another ratio.
+    pub fn psizam_native_frame_ratio(&mut self, ratio: u32) -> &mut Self {
+        self.tunables.psizam_native_frame_ratio = Some(ratio);
+        self
+    }
+
     /// A configuration option to force the usage of `memfd_create` on Linux to
     /// be used as the backing source for a module's initial memory image.
     ///

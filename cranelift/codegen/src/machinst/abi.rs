@@ -2538,9 +2538,18 @@ impl<M: ABIMachineSpec> Callee<M> {
                 key: self.sized_stackslot_keys[slot],
             };
         }
+        let layout = self.frame_layout();
+        let frame_size = layout
+            .setup_area_size
+            .checked_add(layout.clobber_size)
+            .and_then(|n| n.checked_add(layout.fixed_frame_storage_size))
+            .and_then(|n| n.checked_add(layout.outgoing_args_size))
+            .and_then(|n| n.checked_add(layout.tail_args_size - layout.incoming_args_size))
+            .unwrap();
         MachBufferFrameLayout {
             frame_to_fp_offset,
             stackslots,
+            frame_size,
         }
     }
 }

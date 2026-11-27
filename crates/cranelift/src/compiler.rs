@@ -62,7 +62,18 @@ struct CompilerContext {
     validator_allocations: FuncValidatorAllocations,
     debug_slot_descriptor: Option<FrameStateSlotBuilder>,
     abi: Option<Abi>,
+    /// For a wasm function compiled under
+    /// `Tunables::psizam_native_frame_ratio`: its stack cost and the most
+    /// native stack one activation may take. Taken when the function is
+    /// finished.
+    psizam_frame_limit: Option<(u32, u64)>,
 }
+
+/// How many functions this process compiled without the mid-end optimizer
+/// because their optimized native frame was larger than
+/// `Tunables::psizam_native_frame_ratio` allows.
+pub static PSIZAM_UNOPTIMIZED_FOR_FRAME: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 
 impl Default for CompilerContext {
     fn default() -> Self {
@@ -73,6 +84,7 @@ impl Default for CompilerContext {
             validator_allocations: Default::default(),
             debug_slot_descriptor: None,
             abi: None,
+            psizam_frame_limit: None,
         }
     }
 }
@@ -525,6 +537,22 @@ impl wasmtime_environ::Compiler for Compiler {
         let wasm_func_ty = types[sig].unwrap_func();
 
         let mut compiler = self.function_compiler();
+
+        // The constraint on this function's native frame, if there is one:
+        // see `Config::psizam_native_frame_ratio`. A function without a cost
+        // is not metered and has no budget to be held against.
+        compiler.cx.psizam_frame_limit = None;
+        if self.tunables.psizam_stack_meter && self.tunables.psizam_native_frame_ratio != 0 {
+            if let Some(costs) = translation.psizam_stack_costs.as_ref() {
+                let cost = costs[def_func_index];
+                if cost != 0 {
+                    compiler.cx.psizam_frame_limit = Some((
+                        cost,
+                        u64::from(cost) * u64::from(self.tunables.psizam_native_frame_ratio),
+                    ));
+                }
+            }
+        }
 
         let context = &mut compiler.cx.codegen_context;
         context.func.signature = wasm_call_signature(isa, wasm_func_ty, &self.tunables);
@@ -1761,16 +1789,64 @@ impl FunctionCompiler<'_> {
         symbol: &str,
         cancel: Cancel<'_>,
     ) -> Result<CompiledFunction, CompileError> {
+        let frame_limit = self.cx.psizam_frame_limit.take();
         let context = &mut self.cx.codegen_context;
         let isa = &*self.compiler.isa;
+
+        // A function with a constraint on its native frame may have to be
+        // compiled a second time, from the function as it is now: compiling
+        // rewrites it in place.
+        let before_optimization = frame_limit.map(|_| context.func.clone());
 
         // Run compilation, but don't propagate the error just yet. This'll
         // mutate `context` and the IR contained within (optionally) but it may
         // fail if the backend has a bug in it. Use `context` after this
         // finishes to optionally emit CLIF and then after that's done actually
         // propagate the error if one happened.
-        let compilation_result =
+        let mut compilation_result =
             compile_maybe_cached(context, isa, self.cx.incremental_cache_ctx.as_mut(), cancel);
+
+        // psizam's constraint on the native frame
+        // (`Config::psizam_native_frame_ratio`), held against the frame that
+        // was actually laid out. The optimizer may keep values the wasm
+        // function does not hold: computed once, used again after a call,
+        // and so alive across it in a spill slot. A frame that came out too
+        // large for that reason is compiled again without the optimizer.
+        // What is still too large then is not produced at all.
+        if let Some((cost, limit)) = frame_limit {
+            let frame_of = |code: &CompiledCode| {
+                u64::from(
+                    code.buffer
+                        .frame_layout()
+                        .map_or(0, |layout| layout.frame_size),
+                )
+            };
+            let optimized = compilation_result.as_ref().ok().map(frame_of);
+            if optimized.is_some_and(|frame| frame > limit) {
+                context.clear();
+                context.func = before_optimization.unwrap();
+                context.skip_optimizer = true;
+                compilation_result = compile_uncached(context, isa, cancel);
+                context.skip_optimizer = false;
+                PSIZAM_UNOPTIMIZED_FOR_FRAME.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                log::debug!(
+                    "`{symbol}`: native frame of {} bytes for a stack cost of {cost}; \
+                     compiled without the optimizer",
+                    optimized.unwrap()
+                );
+                if let Ok(code) = &compilation_result {
+                    let frame = frame_of(code);
+                    if frame > limit {
+                        compilation_result = Err(CompileError::Codegen(format!(
+                            "psizam: the native frame of `{symbol}` is {frame} bytes \
+                             unoptimized ({} optimized) for a stack cost of {cost}: more \
+                             than the {limit} bytes the engine's native frame ratio allows",
+                            optimized.unwrap()
+                        )));
+                    }
+                }
+            }
+        }
 
         if let Some(path) = &self.compiler.clif_dir {
             use std::io::Write;

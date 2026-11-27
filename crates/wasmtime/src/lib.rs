@@ -492,6 +492,8 @@ pub use runtime::*;
 
 #[cfg(any(feature = "cranelift", feature = "winch"))]
 mod compile;
+#[cfg(feature = "cranelift")]
+pub use compile::psizam_unoptimized_for_frame;
 #[cfg(any(feature = "cranelift", feature = "winch"))]
 pub use compile::{CodeBuilder, CodeHint, CompileCancel, CompileCancelled};
 

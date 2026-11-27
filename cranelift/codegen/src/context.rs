@@ -57,6 +57,18 @@ pub struct Context {
 
     /// Reused register allocator context.
     pub(crate) regalloc_ctx: regalloc2::Ctx,
+
+    /// Compile this function without the mid-end optimizer (the e-graph
+    /// pass), whatever the target's `opt_level` says.
+    ///
+    /// Without that pass every value the compiled function holds is one the
+    /// input function computes where it uses it: nothing is computed once
+    /// and kept for a later use, so nothing lives across a call that the
+    /// input did not keep alive itself. An embedder that must bound a
+    /// function's native frame by what its source holds (see
+    /// `MachBufferFrameLayout::frame_size`) compiles a function this way
+    /// when the optimized frame came out too large. Cleared by `clear`.
+    pub skip_optimizer: bool,
 }
 
 impl Context {
@@ -81,6 +93,7 @@ impl Context {
             compiled_code: None,
             want_disasm: false,
             regalloc_ctx: regalloc2::Ctx::default(),
+            skip_optimizer: false,
         }
     }
 
@@ -92,6 +105,7 @@ impl Context {
         self.loop_analysis.clear();
         self.compiled_code = None;
         self.want_disasm = false;
+        self.skip_optimizer = false;
     }
 
     /// Returns the compilation result for this function, available after any `compile` function
@@ -223,7 +237,7 @@ impl Context {
 
         self.func.dfg.resolve_all_aliases();
 
-        if opt_level != OptLevel::None {
+        if opt_level != OptLevel::None && !self.skip_optimizer {
             self.egraph_pass(isa, ctrl_plane)?;
             cancel.check()?;
         }

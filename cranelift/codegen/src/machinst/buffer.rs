@@ -2383,6 +2383,15 @@ pub struct MachBufferFrameLayout {
     pub frame_to_fp_offset: u32,
     /// Offset from bottom of frame for each StackSlot,
     pub stackslots: SecondaryMap<ir::StackSlot, MachBufferStackSlot>,
+    /// The native stack one activation of this function takes: every byte
+    /// between the caller's stack pointer at the call and this function's
+    /// lowest stack pointer. That is the setup area (return address and
+    /// saved frame pointer), the saved clobbered registers, the stack slots
+    /// and spill slots, the outgoing argument area, and whatever the
+    /// function adds to its incoming argument area for tail calls. Each part
+    /// includes its alignment padding. This is the frame as it was laid out,
+    /// not an estimate.
+    pub frame_size: u32,
 }
 
 /// Descriptor for a single stack slot in the compiled function.

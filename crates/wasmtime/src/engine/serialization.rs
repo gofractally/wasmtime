@@ -299,6 +299,7 @@ impl Metadata<'_> {
             // enforces the asymmetric override rule after metadata is read.
             psizam_memory16: _,
             psizam_stack_meter,
+            psizam_native_frame_ratio,
             psizam_unfused_madd,
             collector,
             memory_reservation,
@@ -379,6 +380,11 @@ impl Metadata<'_> {
             psizam_stack_meter,
             other.psizam_stack_meter,
             "psizam stack metering",
+        )?;
+        Self::check_int(
+            psizam_native_frame_ratio,
+            other.psizam_native_frame_ratio,
+            "psizam native frame ratio",
         )?;
         Self::check_bool(
             psizam_unfused_madd,
