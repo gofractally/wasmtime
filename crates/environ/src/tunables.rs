@@ -70,6 +70,10 @@ define_tunables! {
         /// may take per byte of its stack cost, or 0 for no such constraint.
         /// See `Config::psizam_native_frame_ratio`.
         pub psizam_native_frame_ratio: u32,
+        /// Translate every wasm function with a determined native frame
+        /// and compile it without the mid-end optimizer. See
+        /// `Config::psizam_determined_frames`.
+        pub psizam_determined_frames: bool,
         /// Compute relaxed multiply-add as a multiply followed by an add, each
         /// rounded, which is the WebAssembly deterministic profile's
         /// definition. Without it the result is a fused multiply-add.
@@ -273,6 +277,7 @@ impl Tunables {
             psizam_memory16: false,
             psizam_stack_meter: false,
             psizam_native_frame_ratio: 0,
+            psizam_determined_frames: false,
             psizam_unfused_madd: false,
             collector: None,
 

@@ -168,6 +168,44 @@ macro_rules! declare_function_signatures {
 wasmtime_environ::foreach_builtin_function!(declare_function_signatures);
 
 /// The `FuncEnvironment` implementation for use by the `ModuleEnvironment`.
+/// psizam's determined frame: where a function's values live when it is
+/// translated so that its native frame follows from what validation knows
+/// about it, instead of from what the compiler makes of it.
+///
+/// Every wasm local has one stack slot and every position of the wasm
+/// operand stack has one. An operator's operands are loaded from their
+/// positions' slots just before it is translated, and what it leaves on the
+/// operand stack is stored to its positions' slots just after. So no value
+/// outlives the operator that produced it, except in a slot: nothing is
+/// alive across a call that is not in one of
+///
+///   (number of locals) + (deepest operand stack) slots of 16 bytes,
+///
+/// two numbers that are properties of the wasm function. What the register
+/// allocator may still have to spill is alive within one operator only: at
+/// most that operator's operands and results at once.
+///
+/// This is how a single-pass baseline compiler lays a frame out, and it is
+/// as slow. It is used for a function only when the frame of its optimized
+/// code is larger than the embedder's reservation allows for it (see
+/// `Config::psizam_native_frame_ratio`).
+#[derive(Default)]
+pub(crate) struct PsizamSlots {
+    /// The slot and type of each local, by index.
+    locals: Vec<(ir::StackSlot, ir::Type)>,
+    /// The slot of each operand stack position, and the value that was last
+    /// stored to it or loaded from it: while the operand stack model holds
+    /// that value at that position, the slot holds it too.
+    stack: Vec<(ir::StackSlot, ir::Value)>,
+    /// How many operands the operator being translated takes and how many
+    /// values it leaves, as the validator reported them before it validated
+    /// the operator.
+    pub(crate) arity: Option<(u32, u32)>,
+    /// The lowest operand stack position the operator being translated may
+    /// change, set when it starts in reachable code.
+    lowest: Option<usize>,
+}
+
 pub struct FuncEnvironment<'module_environment> {
     compiler: &'module_environment Compiler,
     isa: &'module_environment (dyn TargetIsa + 'static),
@@ -250,6 +288,10 @@ pub struct FuncEnvironment<'module_environment> {
     /// the second.
     psizam_stack_budget: Option<(ir::Value, ir::Value)>,
 
+    /// Set to translate this function with a determined frame: see
+    /// `PsizamSlots`.
+    pub(crate) psizam_slots: Option<PsizamSlots>,
+
     /// Function-local support for translating stack-switching operations.
     stack_switching: StackSwitchingSupport,
 
@@ -331,6 +373,7 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
 
             stack_limit_at_function_entry: None,
             psizam_stack_budget: None,
+            psizam_slots: None,
 
             stack_switching: StackSwitchingSupport::default(),
 
@@ -5432,6 +5475,7 @@ impl FuncEnvironment<'_> {
         _operand_types: Option<&[WasmValType]>,
         builder: &mut FunctionBuilder,
     ) -> WasmResult<()> {
+        self.psizam_load_operands(builder);
         if self.is_reachable() && self.state_slot.is_some() {
             // The breakpoint may invoke the debug handler, which may observe
             // or modify the store's fuel, so synchronize our locally cached
@@ -5459,12 +5503,185 @@ impl FuncEnvironment<'_> {
         Ok(())
     }
 
+    fn psizam_new_slot(builder: &mut FunctionBuilder) -> ir::StackSlot {
+        // 16 bytes, 16-aligned: the widest value there is, a v128.
+        builder.create_sized_stack_slot(ir::StackSlotData::new(
+            ir::StackSlotKind::ExplicitSlot,
+            16,
+            4,
+        ))
+    }
+
+    fn psizam_slot_store(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        slot: ir::StackSlot,
+        value: ir::Value,
+    ) {
+        let region = self.alias_regions.stack_slot_region(builder.func, slot);
+        let address = builder.ins().stack_addr(self.pointer_type(), slot, 0);
+        let ty = builder.func.dfg.value_type(value);
+        let flags = self
+            .memflags_for_debug_slot_value_clif_ty(ty)
+            .with_alias_region(Some(region));
+        builder.ins().store(flags, value, address, 0);
+    }
+
+    fn psizam_slot_load(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        slot: ir::StackSlot,
+        ty: ir::Type,
+    ) -> ir::Value {
+        let region = self.alias_regions.stack_slot_region(builder.func, slot);
+        let address = builder.ins().stack_addr(self.pointer_type(), slot, 0);
+        let flags = self
+            .memflags_for_debug_slot_value_clif_ty(ty)
+            .with_alias_region(Some(region));
+        builder.ins().load(ty, flags, address, 0)
+    }
+
+    /// In the determined frame: gives local `index` its slot and stores its
+    /// initial value there. A local without one (a non-nullable reference,
+    /// which validation shows is set before it is read) gets its slot and no
+    /// store.
+    pub(crate) fn psizam_local_init(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        index: usize,
+        ty: ir::Type,
+        value: Option<ir::Value>,
+    ) {
+        let Some(slots) = self.psizam_slots.as_mut() else {
+            return;
+        };
+        debug_assert_eq!(slots.locals.len(), index);
+        let slot = Self::psizam_new_slot(builder);
+        slots.locals.push((slot, ty));
+        if let Some(value) = value {
+            debug_assert_eq!(builder.func.dfg.value_type(value), ty);
+            self.psizam_slot_store(builder, slot, value);
+        }
+    }
+
+    /// In the determined frame: the value of local `index`, read from its
+    /// slot. `None` otherwise.
+    pub(crate) fn psizam_local_get(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        index: u32,
+    ) -> Option<ir::Value> {
+        let (slot, ty) = self.psizam_slots.as_ref()?.locals[index as usize];
+        Some(self.psizam_slot_load(builder, slot, ty))
+    }
+
+    /// In the determined frame: stores `value` to the slot of local `index`
+    /// and returns true. False otherwise.
+    pub(crate) fn psizam_local_set(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        index: u32,
+        value: ir::Value,
+    ) -> bool {
+        let Some(slots) = self.psizam_slots.as_ref() else {
+            return false;
+        };
+        let (slot, ty) = slots.locals[index as usize];
+        debug_assert_eq!(builder.func.dfg.value_type(value), ty);
+        self.psizam_slot_store(builder, slot, value);
+        true
+    }
+
+    /// In the determined frame, before an operator is translated: its
+    /// operands are loaded from the slots of their operand stack positions.
+    /// The values the operand stack model held for them are not used again.
+    fn psizam_load_operands(&mut self, builder: &mut FunctionBuilder) {
+        let reachable = self.is_reachable();
+        let Some(slots) = self.psizam_slots.as_mut() else {
+            return;
+        };
+        slots.lowest = None;
+        if !reachable {
+            return;
+        }
+        let height = self.stacks.stack.len();
+        let operands = slots.arity.map_or(0, |(operands, _)| operands as usize);
+        let lowest = height.saturating_sub(operands);
+        slots.lowest = Some(lowest);
+        for position in lowest..height {
+            // A position whose value never reached its slot keeps the value
+            // the model holds: correct, only longer-lived than intended.
+            let model = self.stacks.stack[position];
+            let slot = match self.psizam_slots.as_ref().unwrap().stack.get(position) {
+                Some(&(slot, held)) if held == model => slot,
+                _ => continue,
+            };
+            let ty = builder.func.dfg.value_type(model);
+            // An integer constant is made again where it is used, not read
+            // back: the translation of some operators depends on seeing that
+            // an operand is a constant (what a bulk operation is charged in
+            // fuel, for one), and it must translate them as it does without
+            // the determined frame.
+            let loaded = match Self::value_as_const_int(builder, model) {
+                Some(bits) if ty.is_int() && ty.bits() <= 64 => builder
+                    .ins()
+                    .iconst(ty, ir::immediates::Imm64::new(bits.cast_signed())),
+                _ => self.psizam_slot_load(builder, slot, ty),
+            };
+            self.stacks.stack[position] = loaded;
+            self.psizam_slots.as_mut().unwrap().stack[position].1 = loaded;
+        }
+    }
+
+    /// In the determined frame, after an operator has been translated: what
+    /// it left on the operand stack is stored to the slots of its positions.
+    fn psizam_store_results(&mut self, builder: &mut FunctionBuilder) {
+        let reachable = self.is_reachable();
+        let Some(slots) = self.psizam_slots.as_mut() else {
+            return;
+        };
+        if !reachable {
+            return;
+        }
+        let height = self.stacks.stack.len();
+        slots.lowest = None;
+        // Every position whose value is not the one its slot holds is
+        // stored. An operator changes a top part of the operand stack only,
+        // so the positions are looked at from the top down to the first one
+        // that is unchanged below everything the operator said it takes.
+        let reported = height.saturating_sub(
+            slots
+                .arity
+                .map_or(0, |(operands, results)| operands.max(results) as usize),
+        );
+        let mut position = height;
+        while position > 0 {
+            position -= 1;
+            let model = self.stacks.stack[position];
+            let slots = self.psizam_slots.as_mut().unwrap();
+            while slots.stack.len() <= position {
+                let slot = Self::psizam_new_slot(builder);
+                slots.stack.push((slot, ir::Value::reserved_value()));
+            }
+            let (slot, held) = slots.stack[position];
+            if held == model {
+                if position < reported {
+                    break;
+                }
+                continue;
+            }
+            slots.stack[position].1 = model;
+            self.psizam_slot_store(builder, slot, model);
+        }
+    }
+
     pub fn after_translate_operator(
         &mut self,
         op: &Operator,
         validator: &FuncValidator<impl WasmModuleResources>,
         builder: &mut FunctionBuilder,
     ) -> WasmResult<()> {
+        self.psizam_store_results(builder);
         if self.tunables.consume_fuel && self.is_reachable() {
             self.fuel_after_op(op, builder);
         }
@@ -5516,11 +5733,10 @@ impl FuncEnvironment<'_> {
             let after = if cost == 0 {
                 remaining
             } else {
-                let overflow = builder.ins().icmp_imm_u(
-                    IntCC::UnsignedLessThan,
-                    remaining,
-                    i64::from(cost),
-                );
+                let overflow =
+                    builder
+                        .ins()
+                        .icmp_imm_u(IntCC::UnsignedLessThan, remaining, i64::from(cost));
                 self.trapnz(builder, overflow, ir::TrapCode::STACK_OVERFLOW);
                 builder.ins().iadd_imm_s(remaining, -i64::from(cost))
             };

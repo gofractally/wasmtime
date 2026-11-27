@@ -160,7 +160,10 @@ pub fn translate_operator(
          *  disappear in the Cranelift Code
          ***********************************************************************************/
         Operator::LocalGet { local_index } => {
-            let val = builder.use_var(Variable::from_u32(*local_index));
+            let val = match environ.psizam_local_get(builder, *local_index) {
+                Some(val) => val,
+                None => builder.use_var(Variable::from_u32(*local_index)),
+            };
             environ.stacks.push1(val);
             let label = ValueLabel::from_u32(*local_index);
             builder.set_val_label(val, label);
@@ -174,7 +177,9 @@ pub fn translate_operator(
                 val = optionally_bitcast_vector(val, I8X16, builder);
             }
 
-            builder.def_var(Variable::from_u32(*local_index), val);
+            if !environ.psizam_local_set(builder, *local_index, val) {
+                builder.def_var(Variable::from_u32(*local_index), val);
+            }
             let label = ValueLabel::from_u32(*local_index);
             builder.set_val_label(val, label);
             environ.state_slot_local_set(builder, *local_index, val);
@@ -188,7 +193,9 @@ pub fn translate_operator(
                 val = optionally_bitcast_vector(val, I8X16, builder);
             }
 
-            builder.def_var(Variable::from_u32(*local_index), val);
+            if !environ.psizam_local_set(builder, *local_index, val) {
+                builder.def_var(Variable::from_u32(*local_index), val);
+            }
             let label = ValueLabel::from_u32(*local_index);
             builder.set_val_label(val, label);
             environ.state_slot_local_set(builder, *local_index, val);

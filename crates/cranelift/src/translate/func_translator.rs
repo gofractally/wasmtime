@@ -177,6 +177,12 @@ fn declare_wasm_parameters(
 
             let param_value = builder.block_params(entry_block)[i];
             builder.def_var(local, param_value);
+            environ.psizam_local_init(
+                builder,
+                local.index(),
+                param_type.value_type,
+                Some(param_value),
+            );
 
             environ.add_state_slot_local(builder, wasm_type, |_, _| Ok(param_value))?;
         }
@@ -277,6 +283,7 @@ fn declare_locals(
             builder.def_var(local, init);
             builder.set_val_label(init, ValueLabel::new(*next_local));
         }
+        environ.psizam_local_init(builder, local.index(), ty, init);
         environ.add_state_slot_local(
             builder,
             environ.convert_valtype(wasm_type)?,
@@ -329,6 +336,11 @@ fn parse_function_body(
 
         let op = reader.read()?;
         environ.next_srcloc = cur_srcloc(&reader.get_binary_reader());
+        // What the operator takes and leaves, asked before it is validated:
+        // an `end` or `else` is described by the block it is still in.
+        if let Some(slots) = environ.psizam_slots.as_mut() {
+            slots.arity = op.operator_arity(&*validator);
+        }
         let operand_types =
             validate_op_and_get_operand_types(validator, environ, &mut operand_types, &op, pos)?;
 

@@ -347,6 +347,7 @@ fn engine_with_ratio(ratio: u32) -> Result<Engine> {
     let mut config = Config::new();
     config.psizam_stack_meter(true);
     config.psizam_native_frame_ratio(ratio);
+    config.collector(crate::Collector::Null);
     Engine::new(&config)
 }
 
@@ -395,11 +396,12 @@ fn frame_ratio_holds() -> Result<()> {
     let unconstrained = run(&Engine::new(with_reserved_stack(&mut config))?, 50)?;
 
     // Constrained to 16 native bytes per cost byte, i.e. 512 bytes for this
-    // function, it is compiled without the optimizer and computes the same.
+    // function, it gets the determined frame and computes the same.
     let before = crate::psizam_unoptimized_for_frame();
     let mut config = Config::new();
     config.psizam_stack_meter(true);
     config.psizam_native_frame_ratio(16);
+    config.collector(crate::Collector::Null);
     let constrained = Engine::new(with_reserved_stack(&mut config))?;
     assert_eq!(run(&constrained, 50)?, unconstrained);
     assert!(crate::psizam_unoptimized_for_frame() > before);
@@ -432,16 +434,20 @@ fn frame_ratio_holds() -> Result<()> {
 
 #[test]
 fn psizam_native_frame_ratio_refuses_what_it_cannot_satisfy() -> Result<()> {
-    // No frame is as small as its cost when the cost is 1: the function is
-    // not produced, rather than produced with a frame the embedder's
-    // reservation does not cover.
+    // No frame is as small as its cost when the cost is 1. A ratio the
+    // determined frame cannot meet is a misconfigured engine, not a property
+    // of the module: it is reported as an internal error, and no code is
+    // produced with a frame the embedder's reservation does not cover.
     let error = Module::new(
         &engine_with_ratio(1)?,
         module_bytes(RECURSE, &[1, 1, 1, 1, 1]),
     )
     .unwrap_err();
     let text = format!("{error:?}");
-    assert!(text.contains("psizam: the native frame of"), "{text}");
+    assert!(
+        text.contains("psizam: internal error: the determined native frame of"),
+        "{text}"
+    );
 
     // The same module with its real costs satisfies a ratio of 16 as it is.
     Module::new(
@@ -459,4 +465,155 @@ fn psizam_native_frame_ratio_is_part_of_what_a_module_was_compiled_with() -> Res
     assert!(unsafe { Module::deserialize(&engine_with_ratio(32)?, &bytes) }.is_err());
     assert!(unsafe { Module::deserialize(&engine()?, &bytes) }.is_err());
     Ok(())
+}
+
+/// Programs that use the operand stack and locals in the ways the determined
+/// frame has to get right: values kept on the stack across calls and across
+/// blocks, blocks, loops and ifs with parameters and results, branches out of
+/// nested blocks carrying values, `br_table`, `select`, `local.tee`,
+/// unreachable code followed by reachable code, multiple results, every
+/// value type.
+const SHAPES: &str = r#"(module
+    (type $pair (func (param i32 i32) (result i32 i32)))
+    (func $swap (type $pair) (local.get 1) (local.get 0))
+    (func $id64 (param i64) (result i64) (local.get 0))
+    (func (export "across_calls") (param i32) (result i32)
+        (local.get 0) (i32.const 7)
+        (call $swap (i32.const 1) (i32.const 2))
+        (i32.sub) (i32.add) (i32.add))
+    (func (export "fib") (param i32) (result i32)
+        (if (result i32) (i32.lt_u (local.get 0) (i32.const 2))
+            (then (local.get 0))
+            (else (i32.add
+                (call 3 (i32.sub (local.get 0) (i32.const 1)))
+                (call 3 (i32.sub (local.get 0) (i32.const 2)))))))
+    (func (export "loop_params") (param i32) (result i32)
+        (i32.const 0) (local.get 0)
+        (loop $again (param i32 i32) (result i32)
+            (local.set 0)
+            (local.get 0) (i32.add)
+            (local.get 0) (i32.const 1) (i32.sub)
+            (local.tee 0)
+            (br_if $again (local.get 0))
+            (drop)))
+    (func (export "if_params") (param i32 i32) (result i32)
+        (local.get 0) (local.get 1)
+        (i32.gt_s (local.get 0) (local.get 1))
+        (if (param i32 i32) (result i32)
+            (then (i32.sub))
+            (else (call $swap) (i32.sub))))
+    (func (export "br_values") (param i32) (result i32)
+        (i32.const 100)
+        (block $out (result i32)
+            (i32.const 1)
+            (block $in (result i32)
+                (i32.const 2)
+                (br_if $out (i32.const 40) (local.get 0))
+                (drop)
+                (br $in (i32.const 50))
+                (unreachable))
+            (i32.add))
+        (i32.add))
+    (func (export "table") (param i32) (result i32)
+        (block $c (result i32) (block $b (result i32) (block $a (result i32)
+            (i32.const 5)
+            (br_table $a $b $c (local.get 0)))
+            (i32.const 10) (i32.add))
+            (i32.const 100) (i32.add)))
+    (func (export "select_tee") (param i32 i64) (result i64) (local i64)
+        (local.tee 2 (i64.mul (local.get 1) (i64.const 3)))
+        (call $id64 (local.get 1))
+        (select (local.get 0))
+        (local.get 2) (i64.add))
+    (func (export "floats") (param f32 f64) (result f64) (local f32)
+        (local.set 2 (f32.mul (local.get 0) (f32.const 2)))
+        (f64.promote_f32 (local.get 2))
+        (call $id64 (i64.const 0)) (drop)
+        (local.get 1) (f64.add))
+    (func (export "vectors") (param i32) (result i32) (local v128)
+        (local.set 1 (i32x4.splat (local.get 0)))
+        (local.get 1)
+        (call $id64 (i64.const 0)) (drop)
+        (i32x4.add (i32x4.splat (i32.const 1)))
+        (i32x4.extract_lane 2))
+    (func (export "early_return") (param i32) (result i32)
+        (i32.const 9)
+        (if (local.get 0) (then (return (i32.const 1))))
+        (i32.const 3) (i32.mul))
+    (memory 1)
+    (func (export "memory") (param i32) (result i32)
+        (i32.store (i32.const 8) (local.get 0))
+        (i32.load (i32.const 8)) (i32.load8_u (i32.const 8)) (i32.add))
+)"#;
+const SHAPES_COSTS: [u32; 13] = [64; 13];
+
+#[test]
+fn psizam_determined_frames_compute_what_optimized_code_computes() -> Result<()> {
+    let wasm = module_bytes(SHAPES, &SHAPES_COSTS);
+    let mut results = Vec::new();
+    for determined in [false, true] {
+        let mut config = Config::new();
+        config.psizam_stack_meter(true);
+        config.psizam_determined_frames(determined);
+        config.collector(crate::Collector::Null);
+        let engine = Engine::new(&config)?;
+        let module = Module::new(&engine, &wasm)?;
+        let mut store = Store::new(&engine, ());
+        let instance = Instance::new(&mut store, &module, &[])?;
+        store.psizam_set_stack_remaining(1 << 16);
+        let mut out = Vec::new();
+        macro_rules! call {
+            ($name:literal, $args:ty, $ret:ty, $($value:expr),*) => {{
+                let f = instance.get_typed_func::<$args, $ret>(&mut store, $name)?;
+                $( out.push(format!("{} {:?}", $name, f.call(&mut store, $value)?)); )*
+            }};
+        }
+        call!("across_calls", i32, i32, 0, 5, -3);
+        call!("fib", i32, i32, 0, 1, 2, 10, 15);
+        call!("loop_params", i32, i32, 1, 2, 10);
+        call!("if_params", (i32, i32), i32, (5, 2), (2, 5), (3, 3));
+        call!("br_values", i32, i32, 0, 1);
+        call!("table", i32, i32, 0, 1, 2, 7);
+        call!("select_tee", (i32, i64), i64, (0, 5), (1, 5));
+        call!("floats", (f32, f64), f64, (1.5, 2.25));
+        call!("vectors", i32, i32, 41);
+        call!("early_return", i32, i32, 0, 1);
+        call!("memory", i32, i32, 0x1234);
+        results.push(out);
+    }
+    assert_eq!(results[0], results[1]);
+    // And they are what the functions mean.
+    assert!(
+        results[1].contains(&"fib 610".to_string()),
+        "{:?}",
+        results[1]
+    );
+    assert!(
+        results[1].contains(&"loop_params 55".to_string()),
+        "{:?}",
+        results[1]
+    );
+    Ok(())
+}
+
+/// The determined frame's slots are not traced, so the constraint is refused
+/// with a collector that collects.
+#[test]
+fn psizam_native_frame_ratio_requires_that_nothing_is_collected() {
+    for collector in [
+        crate::Collector::DeferredReferenceCounting,
+        crate::Collector::Copying,
+    ] {
+        let mut config = Config::new();
+        config.psizam_stack_meter(true);
+        config.psizam_native_frame_ratio(16);
+        config.collector(collector);
+        let error = Engine::new(&config).err().expect("refused");
+        assert!(error.to_string().contains("Collector::Null"), "{error}");
+    }
+    let mut config = Config::new();
+    config.psizam_stack_meter(true);
+    config.psizam_native_frame_ratio(16);
+    config.gc_support(false);
+    Engine::new(&config).expect("no GC support");
 }

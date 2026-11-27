@@ -67,11 +67,16 @@ struct CompilerContext {
     /// native stack one activation may take. Taken when the function is
     /// finished.
     psizam_frame_limit: Option<(u32, u64)>,
+    /// The code of a function that had to be compiled while it was being
+    /// translated, because which translation to use depended on its frame:
+    /// `finish_compiling` takes it instead of compiling again.
+    psizam_compiled: Option<CompiledCode>,
 }
 
-/// How many functions this process compiled without the mid-end optimizer
-/// because their optimized native frame was larger than
-/// `Tunables::psizam_native_frame_ratio` allows.
+/// How many functions this process compiled with a determined frame (see
+/// `PsizamSlots` in `func_environ.rs`) because the native frame of their
+/// optimized code was larger than `Tunables::psizam_native_frame_ratio`
+/// allows.
 pub static PSIZAM_UNOPTIMIZED_FOR_FRAME: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
@@ -85,6 +90,7 @@ impl Default for CompilerContext {
             debug_slot_descriptor: None,
             abi: None,
             psizam_frame_limit: None,
+            psizam_compiled: None,
         }
     }
 }
@@ -554,94 +560,176 @@ impl wasmtime_environ::Compiler for Compiler {
             }
         }
 
-        let context = &mut compiler.cx.codegen_context;
-        context.func.signature = wasm_call_signature(isa, wasm_func_ty, &self.tunables);
-        let (namespace, index) = key.into_raw_parts();
-        context.func.name = UserFuncName::User(UserExternalName { namespace, index });
-
-        if self.tunables.debug_native {
-            context.func.collect_debug_info();
-        }
-
+        let cancel_flag = match cancel {
+            Some(cancel) => Cancel::new(cancel.flag()),
+            None => Cancel::never(),
+        };
         // Branch hints are keyed by function-body-relative offset, so the body's
         // module-relative start is needed to convert source locations later.
         let FunctionBodyData { validator, body } = input;
         let func_body_offset = body.get_binary_reader().original_position();
 
-        let mut func_env = FuncEnvironment::new(
-            self,
-            translation,
-            types,
-            wasm_func_ty,
-            key,
-            Some(func_index),
-            func_body_offset,
-        );
+        // A function under the native frame constraint may have to be
+        // translated twice, and a validator validates a function once.
+        let mut again_validator =
+            compiler
+                .cx
+                .psizam_frame_limit
+                .map(|_| wasmparser::FuncToValidate {
+                    resources: validator.resources.clone(),
+                    index: validator.index,
+                    ty: validator.ty,
+                    features: validator.features,
+                });
+        let mut first_validator = Some(validator);
+        let mut needs_gc_heap;
 
-        // The `stack_limit` global value below is the implementation of stack
-        // overflow checks in Wasmtime.
-        //
-        // The Wasm spec defines that stack overflows will raise a trap, and
-        // there's also an added constraint where as an embedder you frequently
-        // are running host-provided code called from wasm. WebAssembly and
-        // native code currently share the same call stack, so Wasmtime needs to
-        // make sure that host-provided code will have enough call-stack
-        // available to it.
-        //
-        // The way that stack overflow is handled here is by adding a prologue
-        // check to all functions for how much native stack is remaining. The
-        // `VMContext` pointer is the first argument to all functions, and the
-        // first field of this structure is `*const VMStoreContext` and the
-        // third field of that is the stack limit. Note that the stack limit in
-        // this case means "if the stack pointer goes below this, trap". Each
-        // function which consumes stack space or isn't a leaf function starts
-        // off by loading the stack limit, checking it against the stack
-        // pointer, and optionally traps.
-        //
-        // This manual check allows the embedder to give wasm a relatively
-        // precise amount of stack allocation. Using this scheme we reserve a
-        // chunk of stack for wasm code relative from where wasm code was
-        // called. This ensures that native code called by wasm should have
-        // native stack space to run, and the numbers of stack spaces here
-        // should all be configurable for various embeddings.
-        //
-        // Note that this check is independent of each thread's stack guard page
-        // here. If the stack guard page is reached that's still considered an
-        // abort for the whole program since the runtime limits configured by
-        // the embedder should cause wasm to trap before it reaches that
-        // (ensuring the host has enough space as well for its functionality).
-        if !isa.triple().is_pulley() {
-            let store_ctx = func_env
-                .alias_regions
-                .vmctx()
-                .store_context()
-                .to_deferred_load(&mut context.func);
-            let stack_limit = func_env
-                .alias_regions
-                .vm_store_context()
-                .stack_limit()
-                .to_deferred_load(&mut context.func);
-            let stack_limit = VmctxLoadChain::new([store_ctx, stack_limit].into());
-            if self.tunables.signals_based_traps {
-                let stack_limit = stack_limit.emit_global(&mut context.func);
-                context.func.stack_limit = Some(stack_limit);
-            } else {
-                func_env.stack_limit_at_function_entry = Some(stack_limit);
+        // psizam's native frame constraint
+        // (`Config::psizam_native_frame_ratio`). The function is translated
+        // and compiled as usual, and its frame, as it was laid out, is
+        // compared with what the embedder's reservation allows a function of
+        // its cost. If it is larger, the function is translated again with a
+        // determined frame (`PsizamSlots`) and compiled without the
+        // optimizer, which would undo that. Which of the two is used changes
+        // how fast the function runs and nothing else: the module is
+        // accepted either way, and both fit the reservation.
+        let mut determined = self.tunables.psizam_determined_frames;
+        loop {
+            let context = &mut compiler.cx.codegen_context;
+            context.func.signature = wasm_call_signature(isa, wasm_func_ty, &self.tunables);
+            let (namespace, index) = key.into_raw_parts();
+            context.func.name = UserFuncName::User(UserExternalName { namespace, index });
+
+            if self.tunables.debug_native {
+                context.func.collect_debug_info();
             }
-        }
-        let mut validator =
-            validator.into_validator(mem::take(&mut compiler.cx.validator_allocations));
-        compiler.cx.func_translator.translate_body(
-            &mut validator,
-            body.clone(),
-            &mut context.func,
-            &mut func_env,
-        )?;
 
-        let needs_gc_heap = func_env.needs_gc_heap();
+            let mut func_env = FuncEnvironment::new(
+                self,
+                translation,
+                types,
+                wasm_func_ty,
+                key,
+                Some(func_index),
+                func_body_offset,
+            );
 
-        if let Some((_, slot_builder)) = func_env.state_slot {
-            compiler.cx.debug_slot_descriptor = Some(slot_builder);
+            if determined {
+                func_env.psizam_slots = Some(Default::default());
+            }
+
+            // The `stack_limit` global value below is the implementation of stack
+            // overflow checks in Wasmtime.
+            //
+            // The Wasm spec defines that stack overflows will raise a trap, and
+            // there's also an added constraint where as an embedder you frequently
+            // are running host-provided code called from wasm. WebAssembly and
+            // native code currently share the same call stack, so Wasmtime needs to
+            // make sure that host-provided code will have enough call-stack
+            // available to it.
+            //
+            // The way that stack overflow is handled here is by adding a prologue
+            // check to all functions for how much native stack is remaining. The
+            // `VMContext` pointer is the first argument to all functions, and the
+            // first field of this structure is `*const VMStoreContext` and the
+            // third field of that is the stack limit. Note that the stack limit in
+            // this case means "if the stack pointer goes below this, trap". Each
+            // function which consumes stack space or isn't a leaf function starts
+            // off by loading the stack limit, checking it against the stack
+            // pointer, and optionally traps.
+            //
+            // This manual check allows the embedder to give wasm a relatively
+            // precise amount of stack allocation. Using this scheme we reserve a
+            // chunk of stack for wasm code relative from where wasm code was
+            // called. This ensures that native code called by wasm should have
+            // native stack space to run, and the numbers of stack spaces here
+            // should all be configurable for various embeddings.
+            //
+            // Note that this check is independent of each thread's stack guard page
+            // here. If the stack guard page is reached that's still considered an
+            // abort for the whole program since the runtime limits configured by
+            // the embedder should cause wasm to trap before it reaches that
+            // (ensuring the host has enough space as well for its functionality).
+            if !isa.triple().is_pulley() {
+                let store_ctx = func_env
+                    .alias_regions
+                    .vmctx()
+                    .store_context()
+                    .to_deferred_load(&mut context.func);
+                let stack_limit = func_env
+                    .alias_regions
+                    .vm_store_context()
+                    .stack_limit()
+                    .to_deferred_load(&mut context.func);
+                let stack_limit = VmctxLoadChain::new([store_ctx, stack_limit].into());
+                if self.tunables.signals_based_traps {
+                    let stack_limit = stack_limit.emit_global(&mut context.func);
+                    context.func.stack_limit = Some(stack_limit);
+                } else {
+                    func_env.stack_limit_at_function_entry = Some(stack_limit);
+                }
+            }
+            let mut validator = match first_validator.take() {
+                Some(validator) => {
+                    validator.into_validator(mem::take(&mut compiler.cx.validator_allocations))
+                }
+                None => again_validator
+                    .take()
+                    .unwrap()
+                    .into_validator(Default::default()),
+            };
+            compiler.cx.func_translator.translate_body(
+                &mut validator,
+                body.clone(),
+                &mut context.func,
+                &mut func_env,
+            )?;
+
+            needs_gc_heap = func_env.needs_gc_heap();
+
+            if let Some((_, slot_builder)) = func_env.state_slot {
+                compiler.cx.debug_slot_descriptor = Some(slot_builder);
+            }
+
+            let limit = compiler.cx.psizam_frame_limit;
+            if limit.is_none() && !determined {
+                break;
+            }
+            context.skip_optimizer = determined;
+            let compiled = compile_uncached(context, isa, cancel_flag);
+            context.skip_optimizer = false;
+            let code = compiled?;
+            let frame = u64::from(
+                code.buffer
+                    .frame_layout()
+                    .map_or(0, |layout| layout.frame_size),
+            );
+            match limit {
+                Some((cost, limit)) if frame > limit => {
+                    if determined {
+                        // Not a judgement on the module: the determined
+                        // frame is bounded by construction, so this is a
+                        // defect of this compiler, reported instead of run.
+                        return Err(CompileError::Codegen(format!(
+                            "psizam: internal error: the determined native frame of \
+                             `{symbol}` is {frame} bytes for a stack cost of {cost}, more \
+                             than the {limit} bytes the engine reserves for it"
+                        )));
+                    }
+                    log::debug!(
+                        "`{symbol}`: optimized native frame of {frame} bytes for a stack \
+                         cost of {cost}; using the determined frame"
+                    );
+                    PSIZAM_UNOPTIMIZED_FOR_FRAME
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    context.clear();
+                    determined = true;
+                }
+                _ => {
+                    compiler.cx.psizam_compiled = Some(code);
+                    break;
+                }
+            }
         }
 
         let timing = cranelift_codegen::timing::take_current();
@@ -1789,64 +1877,25 @@ impl FunctionCompiler<'_> {
         symbol: &str,
         cancel: Cancel<'_>,
     ) -> Result<CompiledFunction, CompileError> {
-        let frame_limit = self.cx.psizam_frame_limit.take();
+        self.cx.psizam_frame_limit = None;
+        let precompiled = self.cx.psizam_compiled.take();
         let context = &mut self.cx.codegen_context;
         let isa = &*self.compiler.isa;
-
-        // A function with a constraint on its native frame may have to be
-        // compiled a second time, from the function as it is now: compiling
-        // rewrites it in place.
-        let before_optimization = frame_limit.map(|_| context.func.clone());
 
         // Run compilation, but don't propagate the error just yet. This'll
         // mutate `context` and the IR contained within (optionally) but it may
         // fail if the backend has a bug in it. Use `context` after this
         // finishes to optionally emit CLIF and then after that's done actually
         // propagate the error if one happened.
-        let mut compilation_result =
-            compile_maybe_cached(context, isa, self.cx.incremental_cache_ctx.as_mut(), cancel);
-
-        // psizam's constraint on the native frame
-        // (`Config::psizam_native_frame_ratio`), held against the frame that
-        // was actually laid out. The optimizer may keep values the wasm
-        // function does not hold: computed once, used again after a call,
-        // and so alive across it in a spill slot. A frame that came out too
-        // large for that reason is compiled again without the optimizer.
-        // What is still too large then is not produced at all.
-        if let Some((cost, limit)) = frame_limit {
-            let frame_of = |code: &CompiledCode| {
-                u64::from(
-                    code.buffer
-                        .frame_layout()
-                        .map_or(0, |layout| layout.frame_size),
-                )
-            };
-            let optimized = compilation_result.as_ref().ok().map(frame_of);
-            if optimized.is_some_and(|frame| frame > limit) {
-                context.clear();
-                context.func = before_optimization.unwrap();
-                context.skip_optimizer = true;
-                compilation_result = compile_uncached(context, isa, cancel);
-                context.skip_optimizer = false;
-                PSIZAM_UNOPTIMIZED_FOR_FRAME.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                log::debug!(
-                    "`{symbol}`: native frame of {} bytes for a stack cost of {cost}; \
-                     compiled without the optimizer",
-                    optimized.unwrap()
-                );
-                if let Ok(code) = &compilation_result {
-                    let frame = frame_of(code);
-                    if frame > limit {
-                        compilation_result = Err(CompileError::Codegen(format!(
-                            "psizam: the native frame of `{symbol}` is {frame} bytes \
-                             unoptimized ({} optimized) for a stack cost of {cost}: more \
-                             than the {limit} bytes the engine's native frame ratio allows",
-                            optimized.unwrap()
-                        )));
-                    }
-                }
+        //
+        // A function under psizam's native frame constraint was compiled
+        // when it was translated: see `compile_function`.
+        let compilation_result = match precompiled {
+            Some(code) => Ok(code),
+            None => {
+                compile_maybe_cached(context, isa, self.cx.incremental_cache_ctx.as_mut(), cancel)
             }
-        }
+        };
 
         if let Some(path) = &self.compiler.clif_dir {
             use std::io::Write;

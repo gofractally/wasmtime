@@ -114,9 +114,21 @@ fn run_wast(test: &WastTest, config: WastConfig) -> wasmtime::Result<()> {
     };
 
     let mut cfg = Config::new();
+    // psizam: run the whole suite on the determined frame
+    // (`Config::psizam_determined_frames`), the code a function falls back
+    // to under `Config::psizam_native_frame_ratio`.
+    if std::env::var("PSIZAM_TEST_DETERMINED_FRAMES").is_ok() {
+        cfg.psizam_determined_frames(true);
+    }
     cfg.shared_memory(true);
     wasmtime_test_util::wasmtime_wast::apply_test_config(&mut cfg, &test_config);
     wasmtime_test_util::wasmtime_wast::apply_wast_config(&mut cfg, &config);
+
+    // The determined frame's slots are not traced, so nothing may be
+    // collected (`Config::validate`).
+    if std::env::var("PSIZAM_TEST_DETERMINED_FRAMES").is_ok() {
+        cfg.collector(wasmtime::Collector::Null);
+    }
 
     if is_cranelift {
         cfg.cranelift_debug_verifier(true);

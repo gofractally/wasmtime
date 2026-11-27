@@ -300,6 +300,7 @@ impl Metadata<'_> {
             psizam_memory16: _,
             psizam_stack_meter,
             psizam_native_frame_ratio,
+            psizam_determined_frames,
             psizam_unfused_madd,
             collector,
             memory_reservation,
@@ -385,6 +386,11 @@ impl Metadata<'_> {
             psizam_native_frame_ratio,
             other.psizam_native_frame_ratio,
             "psizam native frame ratio",
+        )?;
+        Self::check_bool(
+            psizam_determined_frames,
+            other.psizam_determined_frames,
+            "psizam determined frames",
         )?;
         Self::check_bool(
             psizam_unfused_madd,

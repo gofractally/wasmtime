@@ -2423,6 +2423,20 @@ impl Config {
         self
     }
 
+    /// Translate every wasm function with a determined native frame and
+    /// compile it without the mid-end optimizer.
+    ///
+    /// This is the code [`Config::psizam_native_frame_ratio`] falls back to
+    /// for a function whose optimized frame is too large, used for all
+    /// functions: every wasm local and every operand stack position has a
+    /// stack slot, and no value outlives the operator that produced it
+    /// except in its slot. It exists so that this code can be tested on
+    /// everything, not for production use: it is several times slower.
+    pub fn psizam_determined_frames(&mut self, enable: bool) -> &mut Self {
+        self.tunables.psizam_determined_frames = Some(enable);
+        self
+    }
+
     /// A configuration option to force the usage of `memfd_create` on Linux to
     /// be used as the backing source for a module's initial memory image.
     ///
@@ -2957,6 +2971,22 @@ impl Config {
         } else {
             None
         };
+
+        // psizam: the determined frame keeps every wasm value in a stack
+        // slot of its own, and those slots are not in the stack maps a
+        // collector traces. References are safe there only when nothing is
+        // ever collected.
+        if (tunables.psizam_determined_frames || tunables.psizam_native_frame_ratio != 0)
+            && !matches!(
+                tunables.collector,
+                None | Some(wasmtime_environ::Collector::Null)
+            )
+        {
+            bail!(
+                "psizam's native frame constraint requires `Collector::Null` \
+                 or no GC support: its stack slots are not traced"
+            );
+        }
 
         if tunables.debug_guest {
             ensure!(
